@@ -1,0 +1,6 @@
+AGENTS.md
+.venv
+.idea
+models
+/resources/cache/
+.env

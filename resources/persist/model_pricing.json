@@ -1,0 +1,46 @@
+{
+  "gpt-5.2": {
+    "input_per_1k_tokens": 0.00175,
+    "output_per_1k_tokens": 0.014
+  },
+  "gpt-5.1-codex-max": {
+    "input_per_1k_tokens": 0.00125,
+    "output_per_1k_tokens": 0.01
+  },
+  "gpt-5.1-codex": {
+    "input_per_1k_tokens": 0.00125,
+    "output_per_1k_tokens": 0.01
+  },
+  "gpt-5.1-codex-mini": {
+    "input_per_1k_tokens": 0.00025,
+    "output_per_1k_tokens": 0.00200
+  },
+  "gpt-5-codex": {
+    "input_per_1k_tokens": 0.00125,
+    "output_per_1k_tokens": 0.01
+  },
+  "gpt-5.1": {
+    "input_per_1k_tokens": 0.00125,
+    "output_per_1k_tokens": 0.01
+  },
+  "gpt-5.1-mini": {
+    "input_per_1k_tokens": 0.00025,
+    "output_per_1k_tokens": 0.00200
+  },
+  "gpt-5": {
+    "input_per_1k_tokens": 0.00125,
+    "output_per_1k_tokens": 0.01
+  },
+  "gpt-5-mini": {
+    "input_per_1k_tokens": 0.00025,
+    "output_per_1k_tokens": 0.00200
+  },
+  "gpt-4.1": {
+    "input_per_1k_tokens": 0.00200,
+    "output_per_1k_tokens": 0.00800
+  },
+  "gpt-4.1-mini": {
+    "input_per_1k_tokens": 0.00040,
+    "output_per_1k_tokens": 0.00160
+  }
+}

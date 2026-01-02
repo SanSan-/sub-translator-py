@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sub-translate"
+dynamic = ["version"]
+description = "Console subtitle translator for ASS/SRT/VTT."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "openai==2.5.0",
+  "python-dotenv==1.1.1",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "sub_translate.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sub_translate*"]
