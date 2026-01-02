@@ -137,5 +137,9 @@ def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
 class FsmTranslator:
     name = "fsm"
 
+    @staticmethod
+    def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
+        return translate_batch(texts, options)
+
 
 __all__ = ["translate_text", "ensure_translator_ready", "TranslatorLoadError", "FsmTranslator"]

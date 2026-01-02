@@ -1,10 +1,11 @@
---extra-index-url https://download.pytorch.org/whl/cu121
-transformers==4.57.1
-torch==2.2.0+cu121
-torchvision==0.17.0+cu121
+--extra-index-url https://download.pytorch.org/whl/cu128
+transformers==4.57.3
+torch @ https://download.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp314-cp314-win_amd64.whl
+torchvision @ https://download.pytorch.org/whl/cu128/torchvision-0.24.1%2Bcu128-cp314-cp314-win_amd64.whl
 sacremoses==0.1.1
 sentencepiece==0.2.1
-bitsandbytes==0.43.1
-openai==2.5.0
-python-dotenv==1.1.1
-pytest==8.3.4
+bitsandbytes==0.49.0
+accelerate==1.12.0
+openai==2.14.0
+python-dotenv==1.2.1
+pytest==9.0.2

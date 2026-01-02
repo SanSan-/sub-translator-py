@@ -2,5 +2,6 @@ AGENTS.md
 .venv
 .idea
 models
+logs
 /resources/cache/
 .env

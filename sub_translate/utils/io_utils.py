@@ -20,7 +20,8 @@ def split_lines(text: str) -> list[str]:
 
 def write_lines(path: Path, lines: list[str]) -> None:
     content = HARD_NEW_LINE_SIGN.join(lines)
-    path.write_text(content, encoding="utf-8")
+    with path.open("w", encoding="utf-8", newline="") as file:
+        file.write(content)
 
 
 __all__ = ["read_text", "split_lines", "write_lines"]

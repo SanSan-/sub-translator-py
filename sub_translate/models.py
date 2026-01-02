@@ -9,6 +9,7 @@ class SrtSubtitlesItem:
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     text: Optional[str] = None
+    cue_id: Optional[str] = None
 
 
 @dataclass(slots=True)

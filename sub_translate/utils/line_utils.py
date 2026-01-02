@@ -140,10 +140,17 @@ def parse_vtt_dialogs(origins: List[str]) -> Dict[int, SrtSubtitlesItem]:
     i = 1
     dialogs: Dict[int, SrtSubtitlesItem] = {}
     while i < len(origins):
+        if clean_line(origins[i]) == EMPTY_STRING:
+            i += 1
+            continue
         line_index = len(dialogs) + 1
         temp: List[str] = []
         times: List[str] = []
-        i += 1
+        cue_id: str | None = None
+        if not srt_time_validator(origins[i]):
+            candidate = origins[i].strip()
+            cue_id = candidate if candidate else None
+            i += 1
         while i < len(origins) and clean_line(origins[i]) != EMPTY_STRING:
             if srt_time_validator(origins[i]):
                 times = srt_time_extract(origins[i])
@@ -155,6 +162,7 @@ def parse_vtt_dialogs(origins: List[str]) -> Dict[int, SrtSubtitlesItem]:
                 start_time=times[0] if times else None,
                 end_time=times[1] if len(times) > 1 else None,
                 text=(SPACE_SIGN + BIG_NEW_LINE_SIGN).join(temp),
+                cue_id=cue_id,
             )
     return dialogs
 
@@ -315,6 +323,11 @@ def _split_chars_by_line(
         for j in range(idx * lines_per_word, idx * lines_per_word + lines_per_word):
             cur = lines[j]
             if cur.get("wordCount", 0) > 0:
+                if not characters:
+                    head = [EMPTY_STRING]
+                    _add_effects(head, cur.get("effects", {}))
+                    temp.append(EMPTY_STRING.join(head))
+                    continue
                 head = [characters[0]]
                 n = 1
                 while (
@@ -340,6 +353,14 @@ def _split_words_by_line(
     temp = list(words)
     for i in range(lines_count):
         cur = lines[i]
+        if not temp:
+            if cur.get("wordCount", 0) > 0:
+                head = [EMPTY_STRING]
+                _add_effects(head, cur.get("effects", {}))
+                result.append(SPACE_SIGN.join(head))
+            else:
+                result.append(EMPTY_STRING)
+            continue
         if cur.get("wordCount", 0) > 0:
             head = [temp[0]]
             j = 1
@@ -447,9 +468,11 @@ def build_export_lines(
             result.append(WEBVTT)
             result.append(EMPTY_STRING)
         for key in correct_sort([int(k) for k in translated_dialogs.keys()]):
+            dialog = dialogs.get(key)
+            if file_format == FileFormat.VTT.value and dialog and dialog.cue_id:
+                result.append(dialog.cue_id)
             if file_format == FileFormat.SRT.value:
                 result.append(str(key))
-            dialog = dialogs.get(key)
             result.append(
                 f"{dialog.start_time if dialog else EMPTY_STRING} --> {dialog.end_time if dialog else EMPTY_STRING}"
             )

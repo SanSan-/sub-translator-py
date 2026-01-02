@@ -5,16 +5,6 @@ from __future__ import annotations
 import re
 from typing import Callable, List, Optional
 
-_HEADING_GAP_PATTERN = re.compile(
-    r"(\*\*[\w \u0400-\u052F]+:\*\*)([\w\u0400-\u052F])",
-    flags=re.UNICODE,
-)
-
-_MD_SCOPE_PATTERN = re.compile(
-    r"^```markdown\n([\w\W]+)\n```$",
-    flags=re.UNICODE,
-)
-
 SOURCE_WRAPPER_PATTERN = re.compile(r"^\s*<SOURCE>\s*(.*?)\s*</SOURCE>\s*$", re.DOTALL)
 
 
@@ -33,8 +23,6 @@ def postprocess_translation(text: str) -> str:
     if not text:
         return text
     text = strip_source_wrapper(text)
-    text = _MD_SCOPE_PATTERN.sub(r"\1", text)
-    text = _HEADING_GAP_PATTERN.sub(r"\1 \2", text)
     text = re.sub(
         r"(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)",
         lambda match: f" *{match.group(1).strip()}* ",
@@ -42,14 +30,6 @@ def postprocess_translation(text: str) -> str:
     )
     text = re.sub(r"(\d+)\^(\d+)\^", r"\1^\2", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\*\*Example\s+(\d+):\*\*", r"**Пример \1:**", text)
-    text = re.sub(r"\*\*Input:\*\*", r"**Ввод:**", text)
-    text = re.sub(r"\*\*Output:\*\*", r"**Вывод:**", text)
-    text = re.sub(r"\*\*Follow up:\*\*", r"**Следующий шаг:**", text)
-    text = re.sub(r"\*\*Explanation:\*\*", r"**Пояснение:**", text)
-    text = re.sub(r"\*\*Constraints:\*\*", r"**Ограничения:**", text)
-    text = re.sub(r"\*\*Note:\*\*", r"**Примечание:**", text)
-    text = re.sub(r"\) ```", r")\n```", text)
     return text
 
 
