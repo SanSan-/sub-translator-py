@@ -16,14 +16,19 @@
 │  │  ├─ google_web.py               # перевод через Google Web RPC
 │  │  ├─ agent.py                    # перевод через OpenAI agent
 │  │  ├─ agent_prompts.py            # шаблоны подсказок для агента
+│  │  ├─ local_utils.py              # общая логика локальных моделей
 │  │  ├─ nllb.py                     # локальный переводчик NLLB
+│  │  ├─ seamless.py                 # локальный переводчик SeamlessM4T
+│  │  ├─ madlad.py                   # локальный переводчик MADLAD
 │  │  └─ fsm.py                      # локальный переводчик FSMT
 │  ├─ utils
 │  │  ├─ line_utils.py               # разбор/очистка/сборка строк субтитров
 │  │  ├─ validation_utils.py         # валидаторы форматов и регэкспы
 │  │  ├─ translation_utils.py        # постобработка переводов
 │  │  ├─ usage_tracker.py            # учёт токенов и стоимости
-│  │  └─ logging_utils.py            # конфигурация логирования
+│  │  ├─ logging_utils.py            # конфигурация логирования
+│  │  ├─ path_utils.py               # утилиты разбора языкового суффикса
+│  │  └─ subtitle_cache.py           # кеш готовых переводов по имени файла
 │  └─ dictionaries
 │     ├─ regex.py                    # регулярные выражения форматов
 │     ├─ languages.py                # языки Google Translate
@@ -46,7 +51,7 @@
 - Умное объединение реплик (smart split) для снижения количества запросов.
 - Восстановление разметки и эффектов после перевода.
 - Перевод пачками и параллельность для Google (agent/nllb/fsm всегда однопоточные).
-- Локальные модели NLLB и FSMT для перевода без внешних API.
+- Локальные модели NLLB, SeamlessM4T, MADLAD и FSMT для перевода без внешних API.
 - Логи, кеши и учёт токенов/стоимости для агентного переводчика.
 
 ## Консольный запуск
@@ -62,7 +67,7 @@ python -m sub_translate \
   --to ru \
   --api google \
   --batch-size 7 \
-  --threads 1 \
+  --threads 3 \
   --smart-split \
   --tld com \
   --timeout 30 \
@@ -74,13 +79,14 @@ python -m sub_translate \
 Ключевые флаги:
 
 - `--input` - путь к входному файлу (обязателен).
-- `--output` - путь к выходному файлу (по умолчанию: `<input>.<to>.<ext>`).
+- `--output` - путь к выходному файлу (по умолчанию: `<input>.<api>.<to>.<ext>`).
 - `--format` - формат субтитров: `ass|srt|vtt` (по умолчанию берётся из расширения).
 - `--from` - язык источника (по умолчанию `auto`).
+- Суффикс языка в имени (`sub.en.vtt`) имеет приоритет над `--from`; при формировании имени результата он заменяется на код `<to>`.
 - `--to` - язык перевода (по умолчанию `ru`).
-- `--api` - переводчик: `google|agent|nllb|fsm`.
+- `--api` - переводчик: `google|agent|nllb|nllb-lite|seamless|madlad|fsm`.
 - `--batch-size` - размер пачки (по умолчанию `7`).
-- `--threads` - число параллельных запросов для Google (для agent/nllb/fsm фиксируется в `1`).
+- `--threads` - число параллельных запросов (по умолчанию `3`, для локальных моделей фиксируется `1`).
 - `--smart-split` - включить умное объединение реплик.
 - `--tld` - домен Google Translate (по умолчанию `com`).
 - `--timeout` - таймаут запроса в секундах (по умолчанию `30`).
@@ -119,7 +125,7 @@ python -m sub_translate --input subs.ass --api fsm --from en --to ru
 
 - Требует `OPENAI_API_KEY` (можно хранить в `.env`).
 - Модель по умолчанию: `gpt-5.1-mini` (переменная `TRANSLATOR_AGENT_MODEL`).
-- Пачки обрабатываются последовательно (один поток).
+- Параллельность настраивается через `--threads`.
 - Промпты можно переопределять через `--agent-system-prompt-file` и `--agent-prompt-file`.
 
 Пример файлов промптов (по умолчанию):
@@ -162,10 +168,28 @@ python -m sub_translate --input subs.ass --api fsm --from en --to ru
 
 ### NLLB (локальная модель)
 
-- Модель: `facebook/nllb-200-distilled-1.3B`, веса лежат в `models/`.
+- Модель по умолчанию: `facebook/nllb-200-3.3B`, доступна через `--api nllb`.
 - При наличии GPU и `bitsandbytes` включается 8-битная квантовка.
 - `--from/--to`: алиасы `en`/`ru` или NLLB-коды (например, `eng_Latn`, `rus_Cyrl`).
 - `auto` трактуется как `en`, перевод выполняется последовательно (один поток).
+
+### NLLB Lite (локальная модель)
+
+- Модель: `facebook/nllb-200-distilled-1.3B`, доступна через `--api nllb-lite`.
+- Поддерживает те же языковые коды, что и NLLB.
+- Перевод выполняется последовательно (один поток).
+
+### SeamlessM4T v2 (Large)
+
+- Модель: `facebook/seamless-m4t-v2-large`, доступна через `--api seamless`.
+- `--from/--to`: коды ISO-639-3 (например, `eng`, `rus`), алиасы `en`/`ru` поддерживаются.
+- `auto` трактуется как `eng`, перевод выполняется последовательно (один поток).
+
+### MADLAD-400
+
+- Модель: `google/madlad400-7b-mt`, доступна через `--api madlad`.
+- `--from/--to`: коды ISO-639-3 (например, `eng`, `rus`), алиасы `en`/`ru` поддерживаются.
+- `auto` трактуется как `eng`, перевод выполняется последовательно (один поток).
 
 ### FSMT (legacy-модель)
 
@@ -258,6 +282,7 @@ TRANSLATOR_WORKERS=3
 
 - `resources/cache/agent_translation_cache.json` - переводы агента.
 - `resources/cache/agent_prompt_cache.json` - метаданные подсказок.
+- `resources/cache/subtitle_translation_cache.json` - кеш готовых файлов перевода по связке `<input>.<api>.<to>`.
 - `resources/cache/usage_stats.json` - статистика токенов и стоимости.
 - `resources/persist/model_pricing.json` - тарифы моделей (опционально).
 

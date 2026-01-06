@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from typing import Dict, Optional
 
@@ -75,6 +76,8 @@ _pricing_table: Dict[str, Dict[str, float]] = {}
 _total_input_tokens = 0
 _total_output_tokens = 0
 _total_cost_usd = 0.0
+_cache_lock = threading.RLock()
+_usage_lock = threading.Lock()
 
 
 def _compute_prompt_cache_key(template: str, variant: str) -> str:
@@ -150,23 +153,30 @@ def _load_request_cache(logger: logging.Logger) -> None:
     try:
         data = json.loads(REQUEST_CACHE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            _request_cache = {str(key): str(value) for key, value in data.items()}
+            with _cache_lock:
+                _request_cache = {str(key): str(value) for key, value in data.items()}
         else:
             logger.warning("Формат кеша переводов агента не распознан, начинаю с пустого состояния.")
-            _request_cache = {}
+            with _cache_lock:
+                _request_cache = {}
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Не удалось загрузить кеш переводов агента: %s", exc)
-        _request_cache = {}
+        with _cache_lock:
+            _request_cache = {}
 
 
 def _save_request_cache(logger: logging.Logger) -> None:
     global _cache_dirty
-    if not _cache_dirty:
-        return
     try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        REQUEST_CACHE_FILE.write_text(json.dumps(_request_cache, ensure_ascii=False, indent=2), encoding="utf-8")
-        _cache_dirty = False
+        with _cache_lock:
+            if not _cache_dirty:
+                return
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            REQUEST_CACHE_FILE.write_text(
+                json.dumps(_request_cache, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _cache_dirty = False
     except OSError as exc:
         logger.warning("Не удалось сохранить кеш переводов агента: %s", exc)
 
@@ -256,8 +266,9 @@ def _normalize_cached_translation(cache_key: str, cached: str, logger: logging.L
     global _cache_dirty
     fixed_cached = postprocess_translation(cached)
     if fixed_cached != cached:
-        _request_cache[cache_key] = fixed_cached
-        _cache_dirty = True
+        with _cache_lock:
+            _request_cache[cache_key] = fixed_cached
+            _cache_dirty = True
         _save_request_cache(logger)
     return fixed_cached
 
@@ -282,10 +293,14 @@ def _apply_usage(usage, logger: logging.Logger) -> None:
     else:
         logger.debug("Для модели %s не заполнены данные usage.", MODEL_NAME)
 
-    _total_input_tokens += input_tokens
-    _total_output_tokens += output_tokens
-    if cost_increment is not None:
-        _total_cost_usd += cost_increment
+    with _usage_lock:
+        _total_input_tokens += input_tokens
+        _total_output_tokens += output_tokens
+        if cost_increment is not None:
+            _total_cost_usd += cost_increment
+        session_input = _total_input_tokens
+        session_output = _total_output_tokens
+        session_cost = _total_cost_usd
     cost_value = cost_increment if cost_increment is not None else 0.0
     logger.info(
         "Лимиты текущего запроса: input=%s, output=%s, total=%s токенов; стоимость текущего запроса ~ $%.4f",
@@ -294,18 +309,25 @@ def _apply_usage(usage, logger: logging.Logger) -> None:
         total_tokens,
         cost_value,
     )
-    session_total_tokens = _total_input_tokens + _total_output_tokens
-    totals = record_usage(
-        source="agent_translator",
-        model=MODEL_NAME,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cost_usd=cost_increment or 0.0,
+    session_total_tokens = session_input + session_output
+    logger.info(
+        "Итог по сессии: input=%s, output=%s, total=%s токенов; стоимость~$%.4f",
+        session_input,
+        session_output,
+        session_total_tokens,
+        session_cost,
     )
+    with _usage_lock:
+        totals = record_usage(
+            source="agent_translator",
+            model=MODEL_NAME,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_increment or 0.0,
+        )
     log_usage_summary(
         logger,
         totals,
-        combined_tokens=session_total_tokens,
     )
 
 
@@ -357,7 +379,8 @@ def translate_text(text: str) -> str:
         return ""
 
     cache_key = _make_cache_key(text)
-    cached = _request_cache.get(cache_key)
+    with _cache_lock:
+        cached = _request_cache.get(cache_key)
     if cached is not None:
         logger.debug("Перевод найден в локальном кеше агента (ключ %s).", cache_key)
         return _normalize_cached_translation(cache_key, cached, logger)
@@ -367,8 +390,9 @@ def translate_text(text: str) -> str:
     output = postprocess_translation(output)
 
     global _cache_dirty
-    _request_cache[cache_key] = output
-    _cache_dirty = True
+    with _cache_lock:
+        _request_cache[cache_key] = output
+        _cache_dirty = True
     _save_request_cache(logger)
     return output
 
@@ -408,7 +432,8 @@ def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
             result[idx] = ""
             continue
         cache_key = _make_cache_key(text)
-        cached = _request_cache.get(cache_key)
+        with _cache_lock:
+            cached = _request_cache.get(cache_key)
         if cached is not None:
             logger.debug("Перевод найден в локальном кеше агента (ключ %s).", cache_key)
             result[idx] = _normalize_cached_translation(cache_key, cached, logger)
@@ -427,10 +452,11 @@ def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
         if len(translated) != len(pending_texts):
             raise TranslationError("Ответ переводчика не совпадает с размером пачки.")
         global _cache_dirty
-        for idx, cache_key, text in zip(pending_indexes, pending_keys, translated):
-            result[idx] = text
-            _request_cache[cache_key] = text
-            _cache_dirty = True
+        with _cache_lock:
+            for idx, cache_key, text in zip(pending_indexes, pending_keys, translated):
+                result[idx] = text
+                _request_cache[cache_key] = text
+                _cache_dirty = True
         _save_request_cache(logger)
     return result
 

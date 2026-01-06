@@ -12,7 +12,9 @@ from sub_translate.translators.agent import AgentTranslator
 from sub_translate.translators.base import TranslationError, Translator
 from sub_translate.translators.fsm import FsmTranslator
 from sub_translate.translators.google_web import GoogleWebTranslator
-from sub_translate.translators.nllb import NllbTranslator
+from sub_translate.translators.madlad import MadladTranslator
+from sub_translate.translators.nllb import NllbLiteTranslator, NllbTranslator
+from sub_translate.translators.seamless import SeamlessTranslator
 from sub_translate.utils.io_utils import read_text, split_lines, write_lines
 from sub_translate.utils.line_utils import (
     analyse_lines,
@@ -30,6 +32,14 @@ API_ALIASES = {
     "agent": "agent",
     "openai": "agent",
     "nllb": "nllb",
+    "nllb-lite": "nllb-lite",
+    "nllb-3.3b": "nllb",
+    "nllb-200-3.3b": "nllb",
+    "seamless": "seamless",
+    "seamless-m4t": "seamless",
+    "seamless-m4t-v2": "seamless",
+    "madlad": "madlad",
+    "madlad-400": "madlad",
     "fsm": "fsm",
     "fsmt": "fsm",
 }
@@ -58,6 +68,12 @@ def get_translator(api: str, timeout: int) -> Translator:
         return AgentTranslator()
     if api == "nllb":
         return NllbTranslator()
+    if api == "nllb-lite":
+        return NllbLiteTranslator()
+    if api == "seamless":
+        return SeamlessTranslator()
+    if api == "madlad":
+        return MadladTranslator()
     if api == "fsm":
         return FsmTranslator()
     raise TranslationError(f"Неизвестный переводчик: {api}")
@@ -77,7 +93,7 @@ def _translate_batches(
     translated: Dict[int, TranslatedItem] = {}
     batch_size = max(1, int(batch_size or DEFAULT_BATCH_SIZE))
     thread_count = max(1, int(thread_count or DEFAULT_THREAD_COUNT))
-    if getattr(translator, "name", "") in {"agent", "nllb", "fsm"}:
+    if getattr(translator, "name", "") in {"nllb", "nllb-lite", "seamless", "madlad", "fsm"}:
         thread_count = 1
 
     processed = 0

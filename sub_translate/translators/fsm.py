@@ -7,6 +7,7 @@ from sub_translate.constants import MODELS_DIR
 from sub_translate.dictionaries.languages import get_code
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
+from sub_translate.translators.local_utils import resolve_device_and_quantization
 from sub_translate.utils.translation_utils import translate_text as translate_text_common
 
 MODEL_NAME = "facebook/wmt19-en-ru"
@@ -58,12 +59,11 @@ def _ensure_model_loaded() -> None:
         _device = None
         raise TranslatorLoadError("Не удалось загрузить legacy-модель перевода.") from exc
 
-    if torch.cuda.is_available():
-        _device = torch.device("cuda")
-        print("Legacy-модель переводчика загружена в видеопамять (GPU).", flush=True)
-    else:
-        _device = torch.device("cpu")
-        print("Legacy-модель переводчика загружена в оперативную память (CPU).", flush=True)
+    _device, _ = resolve_device_and_quantization(
+        allow_quantization=False,
+        gpu_message="Legacy-модель переводчика загружена в видеопамять (GPU).",
+        cpu_message="Legacy-модель переводчика загружена в оперативную память (CPU).",
+    )
 
     _model.to(_device)
     _model.eval()

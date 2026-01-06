@@ -6,17 +6,13 @@ import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from sub_translate.constants import MODELS_DIR
-from sub_translate.dictionaries.languages import get_code
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
+from sub_translate.translators.local_utils import resolve_device_and_quantization, resolve_lang
 from sub_translate.utils.translation_utils import translate_text as translate_text_common
 
-try:
-    from transformers import BitsAndBytesConfig
-except ImportError:  # pragma: no cover - опциональная зависимость
-    BitsAndBytesConfig = None  # type: ignore[misc,assignment]
-
-MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
+DEFAULT_MODEL_NAME = "facebook/nllb-200-3.3B"
+LITE_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
 MODEL_CACHE_DIR = MODELS_DIR
 MAX_MODEL_INPUT = 512
 MAX_OUTPUT_LENGTH = 1024
@@ -34,45 +30,6 @@ DEFAULT_TARGET_LANG = NLLB_LANGUAGE_ALIASES["ru"]
 
 class TranslatorLoadError(RuntimeError):
     """Исключение, возникающее при невозможности загрузить модель перевода."""
-
-
-_tokenizer: AutoTokenizer | None = None
-_model: AutoModelForSeq2SeqLM | None = None
-_device: torch.device | None = None
-_forced_bos_token_id: int | None = None
-_current_lang_pair: tuple[str, str] | None = None
-
-
-def _normalize_lang(value: str | None) -> str | None:
-    if not value:
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    if value in NLLB_LANGUAGE_ALIASES.values() or _NLLB_CODE_PATTERN.match(value):
-        return value
-    lowered = value.lower()
-    if lowered == "auto":
-        return "auto"
-    if "-" in lowered:
-        lowered = lowered.split("-", 1)[0]
-    if "_" in lowered:
-        lowered = lowered.split("_", 1)[0]
-    return get_code(lowered) or lowered
-
-
-def _resolve_nllb_lang(value: str | None, *, default: str, role: str) -> str:
-    normalized = _normalize_lang(value)
-    if not normalized or normalized == "auto":
-        return default
-    if normalized in NLLB_LANGUAGE_ALIASES:
-        return NLLB_LANGUAGE_ALIASES[normalized]
-    if normalized in NLLB_LANGUAGE_ALIASES.values() or _NLLB_CODE_PATTERN.match(normalized):
-        return normalized
-    raise TranslationError(
-        f"Для NLLB не поддерживается {role} язык '{value}'. "
-        "Используйте код NLLB (например, eng_Latn) или алиас en/ru."
-    )
 
 
 def _describe_incomplete_download() -> str:
@@ -123,113 +80,152 @@ def _resolve_forced_bos(tokenizer: AutoTokenizer, target_lang: str) -> int:
     return token_id
 
 
-def _ensure_model_loaded(source_lang: str, target_lang: str) -> None:
-    global _tokenizer, _model, _device, _forced_bos_token_id, _current_lang_pair
-    if _tokenizer is None or _model is None or _device is None:
-        MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME,
-            cache_dir=str(MODEL_CACHE_DIR),
-            use_fast=False,
+class _NllbEngine:
+    def __init__(self, model_name: str) -> None:
+        self._model_name = model_name
+        self._tokenizer: AutoTokenizer | None = None
+        self._model: AutoModelForSeq2SeqLM | None = None
+        self._device: torch.device | None = None
+        self._forced_bos_token_id: int | None = None
+        self._current_lang_pair: tuple[str, str] | None = None
+
+    def ensure_loaded(self, source_lang: str, target_lang: str) -> None:
+        if self._tokenizer is None or self._model is None or self._device is None:
+            MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self._model_name,
+                cache_dir=str(MODEL_CACHE_DIR),
+                use_fast=False,
+            )
+
+            self._device, quantization_config = resolve_device_and_quantization()
+
+            try:
+                if quantization_config is not None:
+                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                        self._model_name,
+                        cache_dir=str(MODEL_CACHE_DIR),
+                        quantization_config=quantization_config,
+                        device_map="auto",
+                        use_safetensors=True,
+                    )
+                else:
+                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                        self._model_name,
+                        cache_dir=str(MODEL_CACHE_DIR),
+                        use_safetensors=True,
+                    )
+                    self._model.to(self._device)
+            except Exception as exc:  # pragma: no cover - защита от частично загруженных весов
+                self._tokenizer = None
+                self._model = None
+                self._device = None
+                self._forced_bos_token_id = None
+                self._current_lang_pair = None
+                _handle_model_load_error(exc)
+
+            self._model.eval()
+
+        if self._tokenizer is None or self._model is None:
+            raise TranslatorLoadError("Не удалось инициализировать модель перевода.")
+
+        if self._current_lang_pair != (source_lang, target_lang) or self._forced_bos_token_id is None:
+            if hasattr(self._tokenizer, "src_lang"):
+                self._tokenizer.src_lang = source_lang
+            if hasattr(self._tokenizer, "tgt_lang"):
+                self._tokenizer.tgt_lang = target_lang
+            self._forced_bos_token_id = _resolve_forced_bos(self._tokenizer, target_lang)
+            self._current_lang_pair = (source_lang, target_lang)
+
+    def _token_count(self, text: str, source_lang: str, target_lang: str) -> int:
+        self.ensure_loaded(source_lang, target_lang)
+        assert self._tokenizer is not None
+        encoded = self._tokenizer(text, return_tensors="pt", truncation=False)
+        return encoded["input_ids"].shape[-1]
+
+    def _translate_chunk(self, text: str, source_lang: str, target_lang: str) -> str:
+        self.ensure_loaded(source_lang, target_lang)
+        assert (
+            self._tokenizer is not None
+            and self._model is not None
+            and self._device is not None
+            and self._forced_bos_token_id is not None
         )
 
-        device_is_gpu = torch.cuda.is_available()
-        quantization_config = None
-
-        if device_is_gpu and BitsAndBytesConfig is not None:
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-        elif device_is_gpu:
-            print("Библиотека bitsandbytes недоступна - загружаем модель без 8-битной квантовки.", flush=True)
-
-        if device_is_gpu:
-            _device = torch.device("cuda")
-            print("Модель переводчика загружена в видеопамять (GPU).", flush=True)
-        else:
-            _device = torch.device("cpu")
-            print("Модель переводчика загружена в оперативную память (CPU).", flush=True)
-
-        try:
-            if quantization_config is not None:
-                _model = AutoModelForSeq2SeqLM.from_pretrained(
-                    MODEL_NAME,
-                    cache_dir=str(MODEL_CACHE_DIR),
-                    quantization_config=quantization_config,
-                    device_map="auto",
-                    use_safetensors=True,
-                )
-            else:
-                _model = AutoModelForSeq2SeqLM.from_pretrained(
-                    MODEL_NAME,
-                    cache_dir=str(MODEL_CACHE_DIR),
-                    use_safetensors=True,
-                )
-                _model.to(_device)
-        except Exception as exc:  # pragma: no cover - защита от частично загруженных весов
-            _tokenizer = None
-            _model = None
-            _device = None
-            _forced_bos_token_id = None
-            _current_lang_pair = None
-            _handle_model_load_error(exc)
-
-        _model.eval()
-
-    if _tokenizer is None or _model is None:
-        raise TranslatorLoadError("Не удалось инициализировать модель перевода.")
-
-    if _current_lang_pair != (source_lang, target_lang) or _forced_bos_token_id is None:
-        _tokenizer.src_lang = source_lang
-        _tokenizer.tgt_lang = target_lang
-        _forced_bos_token_id = _resolve_forced_bos(_tokenizer, target_lang)
-        _current_lang_pair = (source_lang, target_lang)
-
-
-def _token_count(text: str, source_lang: str, target_lang: str) -> int:
-    _ensure_model_loaded(source_lang, target_lang)
-    assert _tokenizer is not None
-    encoded = _tokenizer(text, return_tensors="pt", truncation=False)
-    return encoded["input_ids"].shape[-1]
-
-
-def _translate_chunk(text: str, source_lang: str, target_lang: str) -> str:
-    _ensure_model_loaded(source_lang, target_lang)
-    assert (
-        _tokenizer is not None
-        and _model is not None
-        and _device is not None
-        and _forced_bos_token_id is not None
-    )
-
-    inputs = _tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=MAX_MODEL_INPUT,
-    )
-    inputs = {key: tensor.to(_device) for key, tensor in inputs.items()}
-
-    with torch.no_grad():
-        outputs = _model.generate(
-            **inputs,
-            max_length=min(MAX_OUTPUT_LENGTH, MAX_MODEL_INPUT * 2),
-            num_beams=4,
-            early_stopping=True,
-            forced_bos_token_id=_forced_bos_token_id,
+        inputs = self._tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=MAX_MODEL_INPUT,
         )
-    return _tokenizer.decode(outputs[0], skip_special_tokens=True)
+        inputs = {key: tensor.to(self._device) for key, tensor in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self._model.generate(
+                **inputs,
+                max_length=min(MAX_OUTPUT_LENGTH, MAX_MODEL_INPUT * 2),
+                num_beams=4,
+                early_stopping=True,
+                forced_bos_token_id=self._forced_bos_token_id,
+            )
+        return self._tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    def translate_text(self, text: str, source_lang: str, target_lang: str) -> str:
+        return translate_text_common(
+            text=text,
+            token_limit=MAX_MODEL_INPUT,
+            token_counter=lambda value: self._token_count(value, source_lang, target_lang),
+            chunk_translator=lambda value: self._translate_chunk(value, source_lang, target_lang),
+        )
+
+    def ensure_ready(self) -> None:
+        self.ensure_loaded(DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG)
+
+
+_DEFAULT_ENGINE = _NllbEngine(DEFAULT_MODEL_NAME)
+_LITE_ENGINE = _NllbEngine(LITE_MODEL_NAME)
 
 
 def translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    return translate_text_common(
-        text=text,
-        token_limit=MAX_MODEL_INPUT,
-        token_counter=lambda value: _token_count(value, source_lang, target_lang),
-        chunk_translator=lambda value: _translate_chunk(value, source_lang, target_lang),
-    )
+    return _DEFAULT_ENGINE.translate_text(text, source_lang, target_lang)
 
 
 def ensure_translator_ready() -> None:
-    _ensure_model_loaded(DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG)
+    _DEFAULT_ENGINE.ensure_ready()
+
+
+def _translate_batch(texts: list[str], options: TranslationOptions, engine: _NllbEngine, label: str) -> list[str]:
+    if not texts:
+        return []
+    source_lang = resolve_lang(
+        options.source_lang,
+        default=DEFAULT_SOURCE_LANG,
+        role="исходный",
+        aliases=NLLB_LANGUAGE_ALIASES,
+        code_pattern=_NLLB_CODE_PATTERN,
+        model_label="NLLB",
+        hint="Используйте код NLLB (например, eng_Latn) или алиас en/ru.",
+    )
+    target_lang = resolve_lang(
+        options.target_lang,
+        default=DEFAULT_TARGET_LANG,
+        role="целевой",
+        aliases=NLLB_LANGUAGE_ALIASES,
+        code_pattern=_NLLB_CODE_PATTERN,
+        model_label="NLLB",
+        hint="Используйте код NLLB (например, eng_Latn) или алиас en/ru.",
+    )
+    try:
+        engine.ensure_loaded(source_lang, target_lang)
+    except TranslatorLoadError as exc:
+        raise TranslationError(str(exc)) from exc
+    result: list[str] = []
+    for text in texts:
+        try:
+            result.append(engine.translate_text(text, source_lang, target_lang))
+        except Exception as exc:
+            raise TranslationError(f"Ошибка перевода через {label}: {exc}") from exc
+    return result
 
 
 class NllbTranslator:
@@ -237,21 +233,21 @@ class NllbTranslator:
 
     @staticmethod
     def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
-        if not texts:
-            return []
-        source_lang = _resolve_nllb_lang(options.source_lang, default=DEFAULT_SOURCE_LANG, role="исходный")
-        target_lang = _resolve_nllb_lang(options.target_lang, default=DEFAULT_TARGET_LANG, role="целевой")
-        try:
-            _ensure_model_loaded(source_lang, target_lang)
-        except TranslatorLoadError as exc:
-            raise TranslationError(str(exc)) from exc
-        result: list[str] = []
-        for text in texts:
-            try:
-                result.append(translate_text(text, source_lang, target_lang))
-            except Exception as exc:
-                raise TranslationError(f"Ошибка перевода через NLLB: {exc}") from exc
-        return result
+        return _translate_batch(texts, options, _DEFAULT_ENGINE, "NLLB")
 
 
-__all__ = ["translate_text", "ensure_translator_ready", "TranslatorLoadError", "NllbTranslator"]
+class NllbLiteTranslator:
+    name = "nllb-lite"
+
+    @staticmethod
+    def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
+        return _translate_batch(texts, options, _LITE_ENGINE, "NLLB Lite")
+
+
+__all__ = [
+    "translate_text",
+    "ensure_translator_ready",
+    "TranslatorLoadError",
+    "NllbTranslator",
+    "NllbLiteTranslator",
+]
