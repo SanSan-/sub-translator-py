@@ -9,8 +9,10 @@ import threading
 import uuid
 from typing import Dict, Optional
 
-from dotenv import load_dotenv
 from openai import OpenAI
+
+from sub_translate.utils.env_utils import load_env
+from sub_translate.translators.local_utils import clear_gpu_memory
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
 from sub_translate.constants import CACHE_DIR, PERSIST_DIR, TRANSLATOR_LOGS_DIR
@@ -63,7 +65,7 @@ class TranslatorLoadError(RuntimeError):
     """Фатальная ошибка инициализации переводчика-агента."""
 
 
-load_dotenv()
+load_env()
 
 MODEL_NAME = os.getenv("TRANSLATOR_AGENT_MODEL", "gpt-5.1-mini")
 
@@ -78,6 +80,47 @@ _total_output_tokens = 0
 _total_cost_usd = 0.0
 _cache_lock = threading.RLock()
 _usage_lock = threading.Lock()
+_init_lock = threading.Lock()
+_model_notice_logged = False
+
+
+def get_agent_model_name() -> str:
+    return MODEL_NAME
+
+
+def get_openai_api_key() -> Optional[str]:
+    return os.getenv("OPENAI_API_KEY")
+
+
+def set_agent_model(model_name: str) -> None:
+    global MODEL_NAME, _client, _pricing_table, _model_notice_logged
+    candidate = model_name.strip()
+    if not candidate or candidate == MODEL_NAME:
+        return
+    MODEL_NAME = candidate
+    os.environ["TRANSLATOR_AGENT_MODEL"] = candidate
+    _model_notice_logged = False
+    _client = None
+    _pricing_table = {}
+    _recompute_prompt_cache_key()
+
+
+def set_openai_api_key(api_key: str) -> None:
+    global _client
+    candidate = api_key.strip()
+    if not candidate:
+        return
+    os.environ["OPENAI_API_KEY"] = candidate
+    _client = None
+
+
+def apply_agent_options(options: TranslationOptions) -> None:
+    model_name = options.agent_model.strip() if options.agent_model else None
+    api_key = options.openai_api_key.strip() if options.openai_api_key else None
+    if model_name:
+        set_agent_model(model_name)
+    if api_key:
+        set_openai_api_key(api_key)
 
 
 def _compute_prompt_cache_key(template: str, variant: str) -> str:
@@ -143,6 +186,20 @@ def _get_logger() -> logging.Logger:
     )
     _logger = logger
     return logger
+
+
+def attach_log_handler(handler: logging.Handler) -> None:
+    """Добавляет внешний обработчик к логам агента."""
+    logger = _get_logger()
+    if handler not in logger.handlers:
+        logger.addHandler(handler)
+
+
+def detach_log_handler(handler: logging.Handler) -> None:
+    """Снимает внешний обработчик логов агента."""
+    logger = _get_logger()
+    if handler in logger.handlers:
+        logger.removeHandler(handler)
 
 
 def _load_request_cache(logger: logging.Logger) -> None:
@@ -214,18 +271,33 @@ def _calculate_request_cost(model: str, input_tokens: int, output_tokens: int) -
 
 
 def ensure_translator_ready() -> None:
-    global _client, _pricing_table
+    global _client, _pricing_table, _model_notice_logged
     logger = _get_logger()
     if _client is not None:
         return
-    try:
-        _client = OpenAI()
-    except Exception as exc:  # pragma: no cover - сетевые/конфигурационные ошибки
-        raise TranslatorLoadError("Не удалось инициализировать клиента OpenAI для переводчика-агента.") from exc
+    with _init_lock:
+        if _client is not None:
+            return
+        try:
+            _client = OpenAI()
+        except Exception as exc:  # pragma: no cover - сетевые/конфигурационные ошибки
+            raise TranslatorLoadError(
+                "Не удалось инициализировать клиента OpenAI для переводчика-агента."
+            ) from exc
 
-    logger.info("Переводчик-агент использует модель: %s", MODEL_NAME)
-    _load_request_cache(logger)
-    _pricing_table = _load_pricing_table(logger)
+        if not _model_notice_logged:
+            logger.info("Переводчик-агент использует модель: %s", MODEL_NAME)
+            _model_notice_logged = True
+        _load_request_cache(logger)
+        _pricing_table = _load_pricing_table(logger)
+
+
+def unload_model() -> None:
+    global _client, _model_notice_logged
+    _client = None
+    _model_notice_logged = False
+    # Очистка памяти (в т.ч. GPU, если используется локальный сервер OpenAI-совместимый)
+    clear_gpu_memory()
 
 
 def set_system_prompt(prompt: str) -> None:
@@ -368,6 +440,14 @@ def _split_batch_output(text: str, separator: str, expected_count: int) -> list[
     pattern = rf"(?:\r?\n)\s*{re.escape(separator)}\s*(?:\r?\n)"
     parts = re.split(pattern, text)
     if len(parts) != expected_count:
+        fallback_pattern = rf"\s*{re.escape(separator)}\s*"
+        parts = re.split(fallback_pattern, text)
+        if len(parts) != expected_count:
+            while parts and parts[0].strip() == "":
+                parts.pop(0)
+            while parts and parts[-1].strip() == "":
+                parts.pop()
+    if len(parts) != expected_count:
         return None
     return parts
 
@@ -420,6 +500,7 @@ def _translate_texts_batch(texts: list[str], logger: logging.Logger) -> list[str
 def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
     if not texts:
         return []
+    apply_agent_options(options)
     ensure_translator_ready()
     logger = _get_logger()
     result = [""] * len(texts)
@@ -466,11 +547,22 @@ class AgentTranslator:
     def translate_batch(self, texts: list[str], options: TranslationOptions) -> list[str]:
         return translate_batch(texts, options)
 
+    @staticmethod
+    def unload() -> None:
+        unload_model()
+
 __all__ = [
     "translate_text",
     "translate_batch",
     "ensure_translator_ready",
     "TranslatorLoadError",
+    "attach_log_handler",
+    "detach_log_handler",
+    "get_agent_model_name",
+    "get_openai_api_key",
+    "set_agent_model",
+    "set_openai_api_key",
+    "apply_agent_options",
     "set_system_prompt",
     "get_user_prompt_variant",
     "use_user_prompt_variant",

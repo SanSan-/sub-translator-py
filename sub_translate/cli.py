@@ -10,6 +10,7 @@ from sub_translate.models import TranslationOptions
 from sub_translate.service import resolve_api, resolve_format, translate_subtitles
 from sub_translate.translators.agent import set_system_prompt, set_user_prompt_template
 from sub_translate.utils.io_utils import read_text
+from sub_translate.utils.env_utils import load_env
 from sub_translate.utils.logging_utils import configure_rotating_logger
 from sub_translate.utils.path_utils import split_lang_suffix
 from sub_translate.utils.subtitle_cache import apply_output_cache, update_output_cache
@@ -29,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_THREAD_COUNT,
         help="Число параллельных запросов (для nllb/nllb-lite/seamless/madlad/fsm фиксируется 1)",
+    )
+    parser.add_argument(
+        "--allow-cpu-fallback",
+        action="store_true",
+        help="Разрешить переход на CPU при ошибках загрузки локальных моделей",
     )
     parser.add_argument("--smart-split", action="store_true", help="Умное объединение реплик")
     parser.add_argument("--tld", default="com", help="Домен Google Translate")
@@ -71,6 +77,7 @@ def resolve_io_paths(
 
 
 def main() -> int:
+    load_env()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -93,6 +100,7 @@ def main() -> int:
         target_lang=args.target_lang,
         api=api,
         tld=args.tld,
+        allow_cpu_fallback=args.allow_cpu_fallback,
     )
 
     if args.agent_system_prompt_file:

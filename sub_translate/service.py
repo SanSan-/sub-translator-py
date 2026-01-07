@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 from sub_translate.constants import DEFAULT_BATCH_SIZE, DEFAULT_THREAD_COUNT
 from sub_translate.enums import FileFormat
@@ -86,6 +86,7 @@ def _translate_batches(
     thread_count: int,
     batch_size: int,
     logger: logging.Logger,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> List[TranslatedItem]:
     total = len(prepare)
     if total == 0:
@@ -115,6 +116,8 @@ def _translate_batches(
                         translated[item.idx] = TranslatedItem(idx=item.idx, text=text, lines=item.lines)
                     processed += len(batch)
                     logger.info("Переведено %s/%s", processed, total)
+                    if progress_callback:
+                        progress_callback(processed, total)
         else:
             for batch in batches:
                 translations = translator.translate_batch(
@@ -127,6 +130,8 @@ def _translate_batches(
                     translated[item.idx] = TranslatedItem(idx=item.idx, text=text, lines=item.lines)
                 processed += len(batch)
                 logger.info("Переведено %s/%s", processed, total)
+                if progress_callback:
+                    progress_callback(processed, total)
     return [translated[idx] for idx in sorted(translated.keys())]
 
 
@@ -142,6 +147,7 @@ def translate_subtitles(
     smart_split: bool,
     timeout: int,
     logger: logging.Logger,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     raw_text = read_text(input_path)
     origins = split_lines(raw_text)
@@ -166,6 +172,7 @@ def translate_subtitles(
         thread_count,
         batch_size,
         logger,
+        progress_callback,
     )
     translated_dialogs = build_translated_dialogs(translated_items, analysis)
     export_lines = build_export_lines(origins, file_format.value, dialogs, translated_dialogs)

@@ -43,6 +43,10 @@ class TranslationOptions:
     target_lang: Optional[str] = None
     api: Optional[str] = None
     tld: Optional[str] = None
+    request_delay_ms: Optional[int] = None
+    allow_cpu_fallback: bool = False
+    agent_model: Optional[str] = None
+    openai_api_key: Optional[str] = None
     except_paths: Optional[List[str]] = None
     detail: bool = False
 

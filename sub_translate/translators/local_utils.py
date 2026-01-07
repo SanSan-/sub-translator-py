@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import re
 
 import torch
@@ -11,6 +12,9 @@ try:
     from transformers import BitsAndBytesConfig
 except ImportError:  # pragma: no cover - опциональная зависимость
     BitsAndBytesConfig = None  # type: ignore[misc,assignment]
+
+MAX_MODEL_INPUT = 512
+MAX_OUTPUT_LENGTH = 1024
 
 
 def normalize_lang(
@@ -66,15 +70,22 @@ def resolve_lang(
 def resolve_device_and_quantization(
     *,
     allow_quantization: bool = True,
+    enable_cpu_offload: bool = False,
     gpu_message: str = "Модель переводчика загружена в видеопамять (GPU).",
     cpu_message: str = "Модель переводчика загружена в оперативную память (CPU).",
 ) -> tuple[torch.device, BitsAndBytesConfig | None]:
-    """Выбирает устройство и опциональную 8-битную квантовку для локальной модели."""
+    """Выбирает устройство и опциональную 8-битную квантовку (с поддержкой CPU offload)."""
     device_is_gpu = torch.cuda.is_available()
     quantization_config = None
     if device_is_gpu and allow_quantization:
         if BitsAndBytesConfig is not None:
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            try:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_enable_fp32_cpu_offload=enable_cpu_offload,
+                )
+            except TypeError:
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
         else:
             print("Библиотека bitsandbytes недоступна - загружаем модель без 8-битной квантовки.", flush=True)
 
@@ -87,4 +98,32 @@ def resolve_device_and_quantization(
     return device, quantization_config
 
 
-__all__ = ["normalize_lang", "resolve_lang", "resolve_device_and_quantization"]
+
+def sanitize_generation_config(model: object) -> None:
+    """Убирает конфликтующие параметры генерации."""
+    config = getattr(model, "generation_config", None)
+    if config is None:
+        return
+    max_new_tokens = getattr(config, "max_new_tokens", None)
+    max_length = getattr(config, "max_length", None)
+    if max_new_tokens is not None and max_length is not None:
+        config.max_new_tokens = None
+
+
+def clear_gpu_memory() -> None:
+    """Принудительно очищает память GPU и запускает сборщик мусора Python."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+__all__ = [
+    "MAX_MODEL_INPUT",
+    "MAX_OUTPUT_LENGTH",
+    "normalize_lang",
+    "resolve_lang",
+    "resolve_device_and_quantization",
+    "sanitize_generation_config",
+    "clear_gpu_memory",
+]

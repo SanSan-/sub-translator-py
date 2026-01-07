@@ -61,6 +61,20 @@ def _extract_cached_lines(
     return None
 
 
+def load_cache_snapshot(logger: logging.Logger) -> dict[str, Any]:
+    """Читает кеш переводов в память."""
+    return _load_cache(logger)
+
+
+def get_cached_lines(
+    cache: dict[str, Any],
+    cache_key: str,
+    file_format: FileFormat,
+) -> list[str] | None:
+    """Возвращает строки перевода из кеша, если формат совпадает."""
+    return _extract_cached_lines(cache, cache_key, file_format)
+
+
 def _store_cached_lines(
     cache: dict[str, Any],
     cache_key: str,
@@ -133,4 +147,10 @@ def update_output_cache(
     _save_cache(cache, logger)
 
 
-__all__ = ["build_cache_key", "apply_output_cache", "update_output_cache"]
+__all__ = [
+    "build_cache_key",
+    "load_cache_snapshot",
+    "get_cached_lines",
+    "apply_output_cache",
+    "update_output_cache",
+]

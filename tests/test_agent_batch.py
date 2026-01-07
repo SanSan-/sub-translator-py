@@ -20,3 +20,10 @@ def test_split_batch_output_allows_spaces_around_separator():
     output = f"First\n {separator} \nSecond"
     parts = agent._split_batch_output(output, separator, 2)
     assert parts == ["First", "Second"]
+
+
+def test_split_batch_output_allows_inline_separator():
+    separator = agent._build_batch_separator()
+    output = f"First {separator} Second"
+    parts = agent._split_batch_output(output, separator, 2)
+    assert parts == ["First", "Second"]

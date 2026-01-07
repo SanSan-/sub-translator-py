@@ -15,5 +15,8 @@ class Translator(Protocol):
     def translate_batch(self, texts: List[str], options: TranslationOptions) -> List[str]:
         ...
 
+    def unload(self) -> None:
+        ...
+
 
 __all__ = ["TranslationError", "Translator"]

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sub Translator UI</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-title">Sub Translator</div>
+        <div class="brand-sub">Локальный и облачный перевод субтитров</div>
+      </div>
+      <div class="actions">
+        <div id="picker" class="picker" role="button" tabindex="0">
+          <div class="picker-icon">⬈</div>
+          <div class="picker-text">Выбор файла/папки</div>
+          <div class="picker-hint">Нажмите, чтобы выбрать файл или папку</div>
+          <div class="picker-actions">
+            <button id="pickerFileBtn" class="btn ghost" type="button">Файл</button>
+            <button id="pickerFolderBtn" class="btn ghost" type="button">Папка</button>
+          </div>
+        </div>
+        <button id="unloadBtn" class="btn ghost" title="Выгрузить модели из памяти">🗑️ Выгрузить</button>
+        <button id="translateBtn" class="btn primary" disabled>Перевести</button>
+      </div>
+    </header>
+
+    <main class="main-grid">
+      <section class="panel panel-files">
+        <div class="panel-header">
+          <span>Файлы</span>
+          <span id="selectedPath" class="panel-sub">Папка не выбрана</span>
+        </div>
+        <div id="fileList" class="file-list empty">
+          <div class="empty-state">Список пуст — выберите файл или папку.</div>
+        </div>
+      </section>
+
+      <section class="panel panel-settings">
+        <div class="panel-header">
+          <span>Настройки перевода</span>
+        </div>
+        <form id="settingsForm" class="settings-form">
+          <div class="field">
+            <label>Переводчик</label>
+            <select data-setting="api">
+              <option value="google">google</option>
+              <option value="agent">agent</option>
+              <option value="nllb">nllb</option>
+              <option value="nllb-lite">nllb-lite</option>
+              <option value="seamless">seamless</option>
+              <option value="madlad">madlad</option>
+              <option value="fsm">fsm</option>
+            </select>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>Откуда</label>
+              <select data-setting="source_lang" id="sourceLang"></select>
+            </div>
+            <div class="field">
+              <label>Куда</label>
+              <select data-setting="target_lang" id="targetLang"></select>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>Размер пачки</label>
+              <input data-setting="batch_size" type="number" min="1">
+            </div>
+            <div class="field">
+              <label>Потоки</label>
+              <input data-setting="threads" type="number" min="1">
+            </div>
+          </div>
+          <div class="field toggle" data-section="local">
+            <label>Разрешить перевод на CPU при ошибке GPU</label>
+            <input data-setting="allow_cpu_fallback" type="checkbox">
+          </div>
+          <div class="grid-2" data-section="google">
+            <div class="field">
+              <label>Домен</label>
+              <input data-setting="tld">
+            </div>
+            <div class="field">
+              <label>Таймаут, сек</label>
+              <input data-setting="timeout" type="number" min="1">
+            </div>
+          </div>
+          <div class="field" data-section="google">
+            <label>Задержка между запросами, мс</label>
+            <input data-setting="request_delay_ms" type="number" min="0">
+          </div>
+          <div class="field toggle">
+            <label>Умное объединение реплик</label>
+            <input data-setting="smart_split" type="checkbox">
+          </div>
+          <div class="field toggle">
+            <label>Подробные логи</label>
+            <input data-setting="verbose" type="checkbox">
+          </div>
+          <div class="field" data-section="agent">
+            <label>Версия модели</label>
+            <input data-setting="agent_model" type="text" placeholder="gpt-5.1-mini">
+          </div>
+          <div class="field" data-section="agent">
+            <label>OpenAI API ключ</label>
+            <div class="prompt-actions">
+              <button type="button" id="editOpenAiKey" class="btn ghost">Открыть ключ</button>
+            </div>
+            <div class="prompt-meta">
+              <span id="openAiKeyStatus">Ключ не задан.</span>
+            </div>
+          </div>
+          <div class="field" data-section="agent">
+            <label>Промпты агента</label>
+            <div class="prompt-actions">
+              <button type="button" id="editSystemPrompt" class="btn ghost">Системный промпт</button>
+              <button type="button" id="editUserPrompt" class="btn ghost">Промпт агента</button>
+            </div>
+            <div class="prompt-meta">
+              <span id="systemPromptStatus">Системный промпт не задан.</span>
+              <span id="userPromptStatus">Промпт агента не задан.</span>
+            </div>
+          </div>
+          <div id="openAiKeyModal" class="modal" hidden>
+            <div class="modal-card">
+              <div class="modal-title">OpenAI API ключ</div>
+              <textarea id="openAiKeyArea" class="prompt-area" data-setting="openai_api_key"></textarea>
+              <div class="modal-actions">
+                <button type="button" class="btn ghost" data-modal-close="openai">Отмена</button>
+                <button type="button" class="btn primary" data-modal-save="openai">Сохранить</button>
+              </div>
+            </div>
+          </div>
+          <div id="systemPromptModal" class="modal" hidden>
+            <div class="modal-card">
+              <div class="modal-title">Системный промпт агента</div>
+              <textarea id="systemPromptArea" class="prompt-area" data-setting="agent_system_prompt"></textarea>
+              <div class="modal-actions">
+                <button type="button" class="btn ghost" data-modal-close="system">Отмена</button>
+                <button type="button" class="btn primary" data-modal-save="system">Сохранить</button>
+              </div>
+            </div>
+          </div>
+          <div id="userPromptModal" class="modal" hidden>
+            <div class="modal-card">
+              <div class="modal-title">Промпт агента</div>
+              <textarea id="userPromptArea" class="prompt-area" data-setting="agent_prompt"></textarea>
+              <div class="modal-actions">
+                <button type="button" class="btn ghost" data-modal-close="user">Отмена</button>
+                <button type="button" class="btn primary" data-modal-save="user">Сохранить</button>
+              </div>
+            </div>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <section class="panel panel-logs">
+      <div class="panel-header">
+        <span>Консоль</span>
+        <div class="log-actions">
+          <button id="clearLogs" class="btn ghost">Очистить</button>
+        </div>
+      </div>
+      <pre id="logConsole" class="log-console"></pre>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

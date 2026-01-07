@@ -8,14 +8,13 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from sub_translate.constants import MODELS_DIR
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
-from sub_translate.translators.local_utils import resolve_device_and_quantization, resolve_lang
+from sub_translate.utils.huggingface import TranslatorLoadError, load_model_components
+from sub_translate.translators.local_utils import MAX_MODEL_INPUT, MAX_OUTPUT_LENGTH, clear_gpu_memory, resolve_lang
 from sub_translate.utils.translation_utils import translate_text as translate_text_common
 
 DEFAULT_MODEL_NAME = "facebook/nllb-200-3.3B"
 LITE_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
 MODEL_CACHE_DIR = MODELS_DIR
-MAX_MODEL_INPUT = 512
-MAX_OUTPUT_LENGTH = 1024
 
 NLLB_LANGUAGE_ALIASES = {
     "en": "eng_Latn",
@@ -26,46 +25,6 @@ _NLLB_CODE_PATTERN = re.compile(r"^[a-z]{3}_[A-Za-z]+$")
 
 DEFAULT_SOURCE_LANG = NLLB_LANGUAGE_ALIASES["en"]
 DEFAULT_TARGET_LANG = NLLB_LANGUAGE_ALIASES["ru"]
-
-
-class TranslatorLoadError(RuntimeError):
-    """Исключение, возникающее при невозможности загрузить модель перевода."""
-
-
-def _describe_incomplete_download() -> str:
-    incomplete = list(MODEL_CACHE_DIR.rglob("*.incomplete"))
-    safetensors = list(MODEL_CACHE_DIR.rglob("model.safetensors"))
-
-    if incomplete:
-        return (
-            "Обнаружены файлы с расширением '.incomplete' в кеше модели. "
-            "Дождитесь завершения загрузки или удалите неполный кеш и повторите попытку."
-        )
-
-    if not safetensors:
-        return (
-            "Файл 'model.safetensors' отсутствует в каталоге кеша. "
-            "Вероятно, загрузка не завершилась - скачайте модель повторно перед запуском перевода."
-        )
-
-    return ""
-
-
-def _handle_model_load_error(exc: Exception) -> None:
-    hint = _describe_incomplete_download()
-    if not hint and isinstance(exc, RuntimeError):
-        message = str(exc)
-        if "torch.load" in message and "v2.6" in message:
-            hint = (
-                "Библиотека transformers пытается открыть бинарные веса через `torch.load`, "
-                "что требует torch>=2.6. Убедитесь, что в кеше есть safetensors-веса."
-            )
-
-    context = "Не удалось загрузить модель перевода."
-    if hint:
-        context = f"{context}\n{hint}"
-
-    raise TranslatorLoadError(context) from exc
 
 
 def _resolve_forced_bos(tokenizer: AutoTokenizer, target_lang: str) -> int:
@@ -88,46 +47,27 @@ class _NllbEngine:
         self._device: torch.device | None = None
         self._forced_bos_token_id: int | None = None
         self._current_lang_pair: tuple[str, str] | None = None
+        self._allow_cpu_fallback = False
 
-    def ensure_loaded(self, source_lang: str, target_lang: str) -> None:
-        if self._tokenizer is None or self._model is None or self._device is None:
-            MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            self._tokenizer = AutoTokenizer.from_pretrained(
+    def ensure_loaded(self, source_lang: str, target_lang: str, *, allow_cpu_fallback: bool = False) -> None:
+        if (
+            self._tokenizer is None
+            or self._model is None
+            or self._device is None
+            or self._allow_cpu_fallback != allow_cpu_fallback
+        ):
+            self._tokenizer, self._model, self._device = load_model_components(
                 self._model_name,
-                cache_dir=str(MODEL_CACHE_DIR),
-                use_fast=False,
+                MODEL_CACHE_DIR,
+                AutoModelForSeq2SeqLM,
+                AutoTokenizer,
+                use_safetensors=True,
+                processor_kwargs={"use_fast": False},
+                allow_cpu_fallback=allow_cpu_fallback,
             )
-
-            self._device, quantization_config = resolve_device_and_quantization()
-
-            try:
-                if quantization_config is not None:
-                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
-                        self._model_name,
-                        cache_dir=str(MODEL_CACHE_DIR),
-                        quantization_config=quantization_config,
-                        device_map="auto",
-                        use_safetensors=True,
-                    )
-                else:
-                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
-                        self._model_name,
-                        cache_dir=str(MODEL_CACHE_DIR),
-                        use_safetensors=True,
-                    )
-                    self._model.to(self._device)
-            except Exception as exc:  # pragma: no cover - защита от частично загруженных весов
-                self._tokenizer = None
-                self._model = None
-                self._device = None
-                self._forced_bos_token_id = None
-                self._current_lang_pair = None
-                _handle_model_load_error(exc)
-
-            self._model.eval()
-
-        if self._tokenizer is None or self._model is None:
-            raise TranslatorLoadError("Не удалось инициализировать модель перевода.")
+            self._allow_cpu_fallback = allow_cpu_fallback
+            self._forced_bos_token_id = None
+            self._current_lang_pair = None
 
         if self._current_lang_pair != (source_lang, target_lang) or self._forced_bos_token_id is None:
             if hasattr(self._tokenizer, "src_lang"):
@@ -138,13 +78,13 @@ class _NllbEngine:
             self._current_lang_pair = (source_lang, target_lang)
 
     def _token_count(self, text: str, source_lang: str, target_lang: str) -> int:
-        self.ensure_loaded(source_lang, target_lang)
+        self.ensure_loaded(source_lang, target_lang, allow_cpu_fallback=self._allow_cpu_fallback)
         assert self._tokenizer is not None
         encoded = self._tokenizer(text, return_tensors="pt", truncation=False)
         return encoded["input_ids"].shape[-1]
 
     def _translate_chunk(self, text: str, source_lang: str, target_lang: str) -> str:
-        self.ensure_loaded(source_lang, target_lang)
+        self.ensure_loaded(source_lang, target_lang, allow_cpu_fallback=self._allow_cpu_fallback)
         assert (
             self._tokenizer is not None
             and self._model is not None
@@ -179,7 +119,16 @@ class _NllbEngine:
         )
 
     def ensure_ready(self) -> None:
-        self.ensure_loaded(DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG)
+        self.ensure_loaded(DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG, allow_cpu_fallback=False)
+
+    def unload(self) -> None:
+        self._tokenizer = None
+        self._model = None
+        self._device = None
+        self._forced_bos_token_id = None
+        self._current_lang_pair = None
+        self._allow_cpu_fallback = False
+        clear_gpu_memory()
 
 
 _DEFAULT_ENGINE = _NllbEngine(DEFAULT_MODEL_NAME)
@@ -215,8 +164,9 @@ def _translate_batch(texts: list[str], options: TranslationOptions, engine: _Nll
         model_label="NLLB",
         hint="Используйте код NLLB (например, eng_Latn) или алиас en/ru.",
     )
+    allow_cpu_fallback = bool(options.allow_cpu_fallback)
     try:
-        engine.ensure_loaded(source_lang, target_lang)
+        engine.ensure_loaded(source_lang, target_lang, allow_cpu_fallback=allow_cpu_fallback)
     except TranslatorLoadError as exc:
         raise TranslationError(str(exc)) from exc
     result: list[str] = []
@@ -235,6 +185,10 @@ class NllbTranslator:
     def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
         return _translate_batch(texts, options, _DEFAULT_ENGINE, "NLLB")
 
+    @staticmethod
+    def unload() -> None:
+        _DEFAULT_ENGINE.unload()
+
 
 class NllbLiteTranslator:
     name = "nllb-lite"
@@ -242,6 +196,10 @@ class NllbLiteTranslator:
     @staticmethod
     def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
         return _translate_batch(texts, options, _LITE_ENGINE, "NLLB Lite")
+
+    @staticmethod
+    def unload() -> None:
+        _LITE_ENGINE.unload()
 
 
 __all__ = [

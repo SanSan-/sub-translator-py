@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
+import time
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
@@ -82,6 +84,9 @@ RESERVED_KEYWORDS = {
     "with",
     "yield",
 }
+
+_delay_lock = threading.Lock()
+_last_request_ts = 0.0
 
 _ASCII_ONLY_RE = re.compile(
     r"^(?!([a-z]+|\d+|[\?=\.\*\[\]~!@#\$%\^&\(\)_+`/\-={}:';'<>,]+)$)"
@@ -435,6 +440,26 @@ def _translate(text: Any, options: TranslationOptions, timeout: int) -> Any:
     return result if detail else result["text"]
 
 
+def _apply_request_delay(options: TranslationOptions) -> None:
+    delay_ms = options.request_delay_ms
+    if delay_ms is None:
+        return
+    try:
+        delay_value = int(delay_ms)
+    except (TypeError, ValueError):
+        return
+    if delay_value <= 0:
+        return
+    delay_seconds = delay_value / 1000.0
+    global _last_request_ts
+    with _delay_lock:
+        now = time.monotonic()
+        wait_for = delay_seconds - (now - _last_request_ts)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        _last_request_ts = time.monotonic()
+
+
 class GoogleWebTranslator:
     name = "google"
 
@@ -444,6 +469,7 @@ class GoogleWebTranslator:
     def translate_batch(self, texts: List[str], options: TranslationOptions) -> List[str]:
         if not texts:
             return []
+        _apply_request_delay(options)
         payload = {str(idx): text for idx, text in enumerate(texts)}
         try:
             translated = _translate(payload, options, self._timeout)
@@ -459,6 +485,9 @@ class GoogleWebTranslator:
         if len(texts) == 1:
             return [str(translated)]
         raise TranslationError("Некорректный ответ от Google Translate.")
+
+    def unload(self) -> None:
+        pass
 
 
 __all__ = ["GoogleWebTranslator"]
