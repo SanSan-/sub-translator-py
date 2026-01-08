@@ -6,7 +6,7 @@ from typing import Any, Type
 import torch
 from transformers import PreTrainedModel
 
-from sub_translate.translators.local_utils import resolve_device_and_quantization, sanitize_generation_config
+from sub_translate.utils.local_utils import resolve_device_and_quantization, sanitize_generation_config
 
 
 class TranslatorLoadError(RuntimeError):

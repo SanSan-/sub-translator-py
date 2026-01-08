@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Разрешить переход на CPU при ошибках загрузки локальных моделей",
     )
     parser.add_argument("--smart-split", action="store_true", help="Умное объединение реплик")
+    parser.add_argument("--force", action="store_true", help="Игнорировать кеш перевода")
     parser.add_argument("--tld", default="com", help="Домен Google Translate")
     parser.add_argument("--timeout", type=int, default=30, help="Таймаут запроса (сек)")
     parser.add_argument("--verbose", action="store_true", help="Подробный вывод")
@@ -122,16 +123,17 @@ def main() -> int:
     logger.info("Выход: %s", output_path)
     logger.info("Пачка: %s, потоки: %s", args.batch_size, args.threads)
 
-    if apply_output_cache(
-        input_path,
-        output_path,
-        api,
-        args.target_lang,
-        file_format,
-        logger,
-    ):
-        logger.info("Готово")
-        return 0
+    if not args.force:
+        if apply_output_cache(
+            input_path,
+            output_path,
+            api,
+            args.target_lang,
+            file_format,
+            logger,
+        ):
+            logger.info("Готово")
+            return 0
 
     translate_subtitles(
         input_path,

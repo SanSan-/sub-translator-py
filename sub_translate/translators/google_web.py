@@ -133,100 +133,65 @@ def _en_map(obj: Any, except_paths: List[str] | None = None, path: str = "", map
     if map_list is None:
         map_list = []
     except_paths = except_paths or []
+    except_reg = (
+        re.compile(r"(^|\.)(%s)(\.|\[|$)" % "|".join(map(re.escape, except_paths)), re.IGNORECASE)
+        if except_paths
+        else None
+    )
 
     def _build_path(base: str, key: Any) -> str:
         if isinstance(key, int):
             return f"{base}[{key}]" if base else f"[{key}]"
         return f"{base}.{key}" if base else str(key)
 
+    def _should_map_value(value: Any, cur_path: str) -> bool:
+        return (
+            isinstance(value, str)
+            and not _is_number(value)
+            and not _is_url(value)
+            and not _is_keyword(value)
+            and not _ASCII_ONLY_RE.match(value)
+            and (not except_reg or not except_reg.search(cur_path))
+        )
+
+    def _append_value(cur_path: str, value: str) -> None:
+        idx = _check_same(value, map_list)
+        if idx > -1:
+            map_list.insert(
+                idx + 1,
+                {
+                    "p": cur_path,
+                    "v": value,
+                    "i": map_list[idx]["i"],
+                    "l": map_list[idx]["l"],
+                    "s": True,
+                },
+            )
+            return
+        last_map = map_list[-1] if map_list else None
+        map_list.append(
+            {
+                "p": cur_path,
+                "v": value,
+                "i": (last_map["i"] + last_map["l"]) if last_map else 0,
+                "l": len(value.split(BR)),
+                "s": False,
+            }
+        )
+
+    def _walk_value(cur_path: str, value: Any) -> None:
+        if isinstance(value, (dict, list)):
+            _en_map(value, except_paths, cur_path, map_list)
+            return
+        if _should_map_value(value, cur_path):
+            _append_value(cur_path, value)
+
     if isinstance(obj, dict):
         for key, value in obj.items():
-            cur_path = _build_path(path, key)
-            if isinstance(value, (dict, list)):
-                _en_map(value, except_paths, cur_path, map_list)
-                continue
-            except_reg = (
-                re.compile(
-                    r"(^|\.)(%s)(\.|\[|$)" % "|".join(map(re.escape, except_paths)), re.IGNORECASE
-                )
-                if except_paths
-                else None
-            )
-            if (
-                isinstance(value, str)
-                and not _is_number(value)
-                and not _is_url(value)
-                and not _is_keyword(value)
-                and not _ASCII_ONLY_RE.match(value)
-                and (not except_reg or not except_reg.search(cur_path))
-            ):
-                idx = _check_same(value, map_list)
-                if idx > -1:
-                    map_list.insert(
-                        idx + 1,
-                        {
-                            "p": cur_path,
-                            "v": value,
-                            "i": map_list[idx]["i"],
-                            "l": map_list[idx]["l"],
-                            "s": True,
-                        },
-                    )
-                else:
-                    last_map = map_list[-1] if map_list else None
-                    map_list.append(
-                        {
-                            "p": cur_path,
-                            "v": value,
-                            "i": (last_map["i"] + last_map["l"]) if last_map else 0,
-                            "l": len(value.split(BR)),
-                            "s": False,
-                        }
-                    )
+            _walk_value(_build_path(path, key), value)
     elif isinstance(obj, list):
         for idx, value in enumerate(obj):
-            cur_path = _build_path(path, idx)
-            if isinstance(value, (dict, list)):
-                _en_map(value, except_paths, cur_path, map_list)
-                continue
-            except_reg = (
-                re.compile(
-                    r"(^|\.)(%s)(\.|\[|$)" % "|".join(map(re.escape, except_paths)), re.IGNORECASE
-                )
-                if except_paths
-                else None
-            )
-            if (
-                isinstance(value, str)
-                and not _is_number(value)
-                and not _is_url(value)
-                and not _is_keyword(value)
-                and not _ASCII_ONLY_RE.match(value)
-                and (not except_reg or not except_reg.search(cur_path))
-            ):
-                idx_match = _check_same(value, map_list)
-                if idx_match > -1:
-                    map_list.insert(
-                        idx_match + 1,
-                        {
-                            "p": cur_path,
-                            "v": value,
-                            "i": map_list[idx_match]["i"],
-                            "l": map_list[idx_match]["l"],
-                            "s": True,
-                        },
-                    )
-                else:
-                    last_map = map_list[-1] if map_list else None
-                    map_list.append(
-                        {
-                            "p": cur_path,
-                            "v": value,
-                            "i": (last_map["i"] + last_map["l"]) if last_map else 0,
-                            "l": len(value.split(BR)),
-                            "s": False,
-                        }
-                    )
+            _walk_value(_build_path(path, idx), value)
     else:
         map_list.append({"p": "", "v": obj, "i": 0, "l": len(str(obj).split(BR))})
     return map_list

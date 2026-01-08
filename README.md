@@ -16,11 +16,11 @@
 │  │  ├─ google_web.py               # перевод через Google Web RPC
 │  │  ├─ agent.py                    # перевод через OpenAI agent
 │  │  ├─ agent_prompts.py            # шаблоны подсказок для агента
-│  │  ├─ local_utils.py              # общая логика локальных моделей
-│  │  ├─ nllb.py                     # локальный переводчик NLLB
-│  │  ├─ seamless.py                 # локальный переводчик SeamlessM4T
-│  │  ├─ madlad.py                   # локальный переводчик MADLAD
-│  │  └─ fsm.py                      # локальный переводчик FSMT
+│  │  └─ local
+│  │     ├─ nllb.py                  # локальный переводчик NLLB
+│  │     ├─ seamless.py              # локальный переводчик SeamlessM4T
+│  │     ├─ madlad.py                # локальный переводчик MADLAD
+│  │     └─ fsm.py                   # локальный переводчик FSMT
 │  ├─ utils
 │  │  ├─ line_utils.py               # разбор/очистка/сборка строк субтитров
 │  │  ├─ validation_utils.py         # валидаторы форматов и регэкспы
@@ -29,6 +29,7 @@
 │  │  ├─ logging_utils.py            # конфигурация логирования
 │  │  ├─ env_utils.py                # загрузка переменных окружения
 │  │  ├─ huggingface.py              # загрузка и fallback HuggingFace-моделей
+│  │  ├─ local_utils.py              # общая логика локальных моделей
 │  │  ├─ path_utils.py               # утилиты разбора языкового суффикса
 │  │  └─ subtitle_cache.py           # кеш готовых переводов по имени файла
 │  ├─ web
@@ -80,6 +81,7 @@ python -m sub_translate \
   --threads 3 \
   --allow-cpu-fallback \
   --smart-split \
+  --force \
   --tld com \
   --timeout 30 \
   --agent-system-prompt-file path\to\system_prompt.txt \
@@ -100,6 +102,7 @@ python -m sub_translate \
 - `--threads` - число параллельных запросов (по умолчанию `3`, для локальных моделей фиксируется `1`).
 - `--allow-cpu-fallback` - разрешить переход на CPU при ошибках загрузки локальных моделей.
 - `--smart-split` - включить умное объединение реплик.
+- `--force` - игнорировать кеш перевода и перезаписать результат.
 - `--tld` - домен Google Translate (по умолчанию `com`).
 - `--timeout` - таймаут запроса в секундах (по умолчанию `30`).
 - `--agent-system-prompt-file` - файл системного промпта агента (UTF-8).
@@ -147,6 +150,40 @@ python -m sub_translate.web
 | Консоль (логи, кнопка "Очистить")                                             |
 +----------------------------------------------------------------------------------+
 ```
+
+## API веб-интерфейса
+
+Все запросы/ответы JSON (UTF-8). Настройки передаются объектом `TranslationSettings`:
+
+- `source_lang`, `target_lang`, `api`
+- `batch_size`, `threads`, `allow_cpu_fallback`, `smart_split`, `force`
+- `smart_split_max_lines`, `smart_split_max_words`, `smart_split_max_chars`, `smart_split_max_gap_ms`, `smart_split_max_duration_ms`
+- `tld`, `timeout`, `request_delay_ms`
+- `agent_model`, `openai_api_key`
+- `agent_system_prompt`, `agent_prompt`
+- `agent_system_prompt_file`, `agent_prompt_file`
+- `verbose`
+
+Файлы в ответах `items`:
+
+- `name`, `path`, `format`, `cached`, `output`
+- в `/api/active-job` дополнительно: `state`, `progress`, `error`
+
+Эндпойнты:
+
+- `GET /api/health` -> `{ "status": "ok" }`
+- `GET /api/ui-config` -> `{ "defaults": ..., "languages": ..., "agent_prompts": ..., "agent_settings": ... }`
+- `GET /api/active-job` -> `{ "active": true|false, "job_id": "...", "items": [...], "logs": [...], "total": N, "done": N }`
+- `POST /api/pick` -> запрос `{ "kind": "file|folder", "settings": TranslationSettings? }`, ответ `{ "mode": "files|folder", "path": "...", "items": [...] }`
+- `POST /api/refresh` -> запрос `{ "paths": [...], "settings": TranslationSettings }`, ответ `{ "items": [...] }`
+- `POST /api/translate` -> запрос `{ "paths": [...], "settings": TranslationSettings }`, ответ `{ "job_id": "..." }`
+  - ошибки: `400` (пустой список), `409` (перевод уже выполняется)
+- `POST /api/unload` -> `{ "status": "ok", "message": "..." }`
+- `GET /api/stream/{job_id}` -> SSE (`text/event-stream`), `data: <json>`
+  - `{"type":"job","total":N}`
+  - `{"type":"file","path":"...","index":1,"total":N,"state":"started|cached|done|error","progress":0-100,"output":"...","error":"..."}`
+  - `{"type":"log","message":"..."}`
+  - `{"type":"done","status":"ok|error"}`
 
 ## Переводчики
 

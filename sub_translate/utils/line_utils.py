@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Dict, List
 
 from sub_translate.constants import (
@@ -10,6 +11,12 @@ from sub_translate.constants import (
     WEBVTT,
     NOT_VTT_ERROR,
     ZERO_INT_SIGN,
+    SMART_SPLIT_MAX_CHARS,
+    SMART_SPLIT_MAX_DURATION_MS,
+    SMART_SPLIT_MAX_GAP_MS,
+    SMART_SPLIT_MAX_LINES,
+    SMART_SPLIT_MAX_WORDS,
+    SMART_SPLIT_COMMA_WINDOW,
     correct_sort,
 )
 from sub_translate.dictionaries.bad_symbols import BAD_SYMBOLS
@@ -47,6 +54,7 @@ from sub_translate.models import (
     AnalysedLine,
     AssSubtitlesItem,
     PrepareToTranslateItem,
+    SmartSplitSettings,
     SrtSubtitlesItem,
     TranslatedDialogItem,
     TranslatedItem,
@@ -60,6 +68,135 @@ from sub_translate.utils.validation_utils import (
     srt_time_extract,
     srt_time_validator,
 )
+
+_SENTENCE_SPACE_DOT_MASK = re.compile(
+    r"([.])(?=(?:[\"')\]]?)[A-Z\u0410-\u042F\u0401])"
+)
+_SENTENCE_SPACE_QE_MASK = re.compile(
+    r"([!?])(?=(?:[\"')\]]?)[A-Z\u0410-\u042F\u0401])"
+)
+_SENTENCE_SKIP_CHARS = {'"', "'", ")", "]"}
+_SENTENCE_START_SKIP_CHARS = {'"', "'", "(", ")", "[", "]", "{", "}", "«", "»", "-", "—", "–"}
+_COMMA_CHARS = {",", "，"}
+
+
+def _is_inside_parentheses(text: str, pos: int) -> bool:
+    segment = text[:pos]
+    return segment.count("(") > segment.count(")")
+
+
+def _should_insert_qe_space(text: str, pos: int) -> bool:
+    if pos <= 0:
+        return True
+    prev_char = text[pos - 1]
+    next_idx = pos + 1
+    while next_idx < len(text) and text[next_idx] in _SENTENCE_SKIP_CHARS:
+        next_idx += 1
+    if next_idx >= len(text):
+        return False
+    next_char = text[next_idx]
+    if prev_char.isascii() and prev_char.isalpha() and next_char.isascii() and next_char.isalpha():
+        if _is_inside_parentheses(text, pos):
+            return False
+        return True
+    return True
+
+
+def _ensure_sentence_spacing(text: str) -> str:
+    temp = _SENTENCE_SPACE_DOT_MASK.sub(r"\1 ", text)
+
+    def _replace_qe(match: re.Match[str]) -> str:
+        if _should_insert_qe_space(match.string, match.start()):
+            return f"{match.group(1)} "
+        return match.group(1)
+
+    return _SENTENCE_SPACE_QE_MASK.sub(_replace_qe, temp)
+
+
+def _starts_with_upper(text: str) -> bool:
+    cleaned = clean_line(text)
+    if not cleaned:
+        return False
+    idx = 0
+    while idx < len(cleaned) and cleaned[idx] in _SENTENCE_START_SKIP_CHARS:
+        idx += 1
+    if idx >= len(cleaned):
+        return False
+    return cleaned[idx].isupper()
+
+
+def _starts_with_lower(text: str) -> bool:
+    cleaned = clean_line(text)
+    if not cleaned:
+        return False
+    idx = 0
+    while idx < len(cleaned) and cleaned[idx] in _SENTENCE_START_SKIP_CHARS:
+        idx += 1
+    if idx >= len(cleaned):
+        return False
+    return cleaned[idx].islower()
+
+
+def _word_has_comma(word: str) -> bool:
+    return any(char in word for char in _COMMA_CHARS)
+
+
+def _adjust_split_by_comma(words: List[str], start_idx: int, count: int, max_count: int) -> int:
+    if SMART_SPLIT_COMMA_WINDOW <= 0 or count <= 0 or max_count <= 0:
+        return count
+    preferred = start_idx + count - 1
+    max_index = start_idx + max_count - 1
+    for offset in range(0, SMART_SPLIT_COMMA_WINDOW + 1):
+        idx = preferred + offset
+        if idx > max_index:
+            break
+        if _word_has_comma(words[idx]):
+            return idx - start_idx + 1
+    for offset in range(1, SMART_SPLIT_COMMA_WINDOW + 1):
+        idx = preferred - offset
+        if idx < start_idx:
+            break
+        if _word_has_comma(words[idx]):
+            return idx - start_idx + 1
+    return count
+
+
+def _split_words_by_weights(words: List[str], weights: List[int]) -> List[int]:
+    if not weights:
+        return []
+    total_words = len(words)
+    if total_words == 0:
+        return [0] * len(weights)
+    suffix_weights: List[int] = []
+    running = 0
+    for weight in reversed(weights):
+        running += max(0, int(weight))
+        suffix_weights.append(running)
+    suffix_weights.reverse()
+    counts: List[int] = []
+    offset = 0
+    for idx, weight in enumerate(weights):
+        remaining_words = total_words - offset
+        remaining_lines = len(weights) - idx
+        if remaining_lines == 1:
+            count = remaining_words
+        else:
+            remaining_weight = suffix_weights[idx]
+            if remaining_weight > 0:
+                raw = int(round(remaining_words * weight / remaining_weight))
+            else:
+                raw = max(1, remaining_words // remaining_lines)
+            max_count = remaining_words - (remaining_lines - 1)
+            if max_count <= 0:
+                count = 0
+            else:
+                count = min(max(raw, 1), max_count)
+                count = _adjust_split_by_comma(words, offset, count, max_count)
+        counts.append(count)
+        offset += count
+    if offset < total_words and counts:
+        counts[-1] += total_words - offset
+    return counts
 
 
 def replace_all_words(input_text: str, source: str, target: str) -> str:
@@ -98,6 +235,7 @@ def clean_line(text: str) -> str:
     temp = ASS_EFFECTS_MASK.sub(EMPTY_STRING, temp)
     temp = ASS_COMMENTS_MASK.sub(EMPTY_STRING, temp)
     temp = SRT_EFFECTS_MASK.sub(EMPTY_STRING, temp)
+    temp = _ensure_sentence_spacing(temp)
     temp = DOUBLE_SPACES_MASK.sub(SPACE_SIGN, temp)
     return temp.strip()
 
@@ -167,26 +305,148 @@ def parse_vtt_dialogs(origins: List[str]) -> Dict[int, SrtSubtitlesItem]:
     return dialogs
 
 
+def _parse_timecode_ms(value: str | None) -> int | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    raw = raw.replace(",", ".")
+    parts = raw.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        seconds_part = parts[-1]
+        if "." in seconds_part:
+            seconds_str, fraction_str = seconds_part.split(".", 1)
+        else:
+            seconds_str, fraction_str = seconds_part, ""
+        seconds = int(seconds_str)
+        minutes = int(parts[-2])
+        hours = int(parts[-3]) if len(parts) >= 3 else 0
+    except ValueError:
+        return None
+    milliseconds = 0
+    if fraction_str:
+        digits = "".join(char for char in fraction_str if char.isdigit())
+        if digits:
+            if len(digits) >= 3:
+                milliseconds = int(digits[:3])
+            elif len(digits) == 2:
+                milliseconds = int(digits) * 10
+            else:
+                milliseconds = int(digits) * 100
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
+
+
 def build_prepare(
-    dialogs: Dict[int, SrtSubtitlesItem], use_smart_dialog_splitter: bool = False
+    dialogs: Dict[int, SrtSubtitlesItem],
+    use_smart_dialog_splitter: bool = False,
+    smart_split_settings: SmartSplitSettings | None = None,
 ) -> List[PrepareToTranslateItem]:
+    def _normalize_setting(value: int | None, default: int) -> int:
+        if value is None:
+            return default
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            return default
+        return numeric if numeric > 0 else default
+
+    max_lines = _normalize_setting(
+        smart_split_settings.max_lines if smart_split_settings else None, SMART_SPLIT_MAX_LINES
+    )
+    max_words = _normalize_setting(
+        smart_split_settings.max_words if smart_split_settings else None, SMART_SPLIT_MAX_WORDS
+    )
+    max_chars = _normalize_setting(
+        smart_split_settings.max_chars if smart_split_settings else None, SMART_SPLIT_MAX_CHARS
+    )
+    max_gap_ms = _normalize_setting(
+        smart_split_settings.max_gap_ms if smart_split_settings else None, SMART_SPLIT_MAX_GAP_MS
+    )
+    max_duration_ms = _normalize_setting(
+        smart_split_settings.max_duration_ms if smart_split_settings else None, SMART_SPLIT_MAX_DURATION_MS
+    )
+
     result: List[PrepareToTranslateItem] = []
     tempo_lines: List[int] = []
     tempo_text = EMPTY_STRING
+    tempo_word_count = 0
+    tempo_char_count = 0
+    tempo_start_ms: int | None = None
+    tempo_end_ms: int | None = None
+    prev_text: str | None = None
+
+    def _flush_tempo() -> None:
+        nonlocal tempo_lines, tempo_text, tempo_word_count, tempo_char_count, tempo_start_ms, tempo_end_ms
+        to_translate = clean_line(tempo_text)
+        if not is_empty(to_translate):
+            result.append(PrepareToTranslateItem(idx=len(result), lines=tempo_lines, to_translate=to_translate))
+        tempo_lines = []
+        tempo_text = EMPTY_STRING
+        tempo_word_count = 0
+        tempo_char_count = 0
+        tempo_start_ms = None
+        tempo_end_ms = None
+
+    def _should_split_before(current_text: str, previous_text: str | None) -> bool:
+        if not use_smart_dialog_splitter or not tempo_lines:
+            return False
+        if not _starts_with_upper(current_text):
+            return False
+        if previous_text and GOOD_END_SYMBOLS_MASK.search(previous_text):
+            return False
+        if previous_text and not _starts_with_lower(previous_text):
+            return False
+        return True
     keys = correct_sort([int(key) for key in dialogs.keys()])
     for idx, key in enumerate(keys):
+        dialog = dialogs[key]
+        dialog_text = dialog.text or EMPTY_STRING
+        if _should_split_before(dialog_text, prev_text):
+            _flush_tempo()
         tempo_lines.append(key)
-        tempo_text += f" {dialogs[key].text or EMPTY_STRING}"
-        if GOOD_END_SYMBOLS_MASK.search(dialogs[key].text or EMPTY_STRING) or not use_smart_dialog_splitter:
-            to_translate = clean_line(tempo_text)
-            if not is_empty(to_translate):
-                result.append(PrepareToTranslateItem(idx=len(result), lines=tempo_lines, to_translate=to_translate))
-            tempo_lines = []
-            tempo_text = EMPTY_STRING
-        elif idx == len(keys) - 1:
-            to_translate = clean_line(tempo_text)
-            if not is_empty(to_translate):
-                result.append(PrepareToTranslateItem(idx=len(result), lines=tempo_lines, to_translate=to_translate))
+        tempo_text += f" {dialog_text}"
+        cleaned = clean_line(dialog_text)
+        if cleaned:
+            tempo_word_count += len([word for word in cleaned.split(SPACE_SIGN) if word])
+            tempo_char_count += len(cleaned)
+        if tempo_start_ms is None:
+            tempo_start_ms = _parse_timecode_ms(dialog.start_time)
+        end_time_ms = _parse_timecode_ms(dialog.end_time)
+        if end_time_ms is not None:
+            tempo_end_ms = end_time_ms
+        should_split = False
+        if not use_smart_dialog_splitter:
+            should_split = True
+        else:
+            if GOOD_END_SYMBOLS_MASK.search(dialog_text):
+                should_split = True
+            elif len(tempo_lines) >= max_lines:
+                should_split = True
+            elif tempo_word_count >= max_words:
+                should_split = True
+            elif tempo_char_count >= max_chars:
+                should_split = True
+            else:
+                if tempo_start_ms is not None and tempo_end_ms is not None:
+                    duration = tempo_end_ms - tempo_start_ms
+                    if duration >= max_duration_ms:
+                        should_split = True
+                if not should_split and idx < len(keys) - 1:
+                    next_dialog = dialogs.get(keys[idx + 1])
+                    if next_dialog is not None:
+                        next_start = _parse_timecode_ms(next_dialog.start_time)
+                        if (
+                            end_time_ms is not None
+                            and next_start is not None
+                            and next_start - end_time_ms >= max_gap_ms
+                        ):
+                            should_split = True
+        if should_split or idx == len(keys) - 1:
+            _flush_tempo()
+        prev_text = dialog_text
     return result
 
 
@@ -409,25 +669,26 @@ def build_translated_dialogs(
         lines_count = len(line_idxs)
         text = clean_line(item.text)
         if lines_count > 1:
-            words = text.split(SPACE_SIGN)
+            words = [word for word in text.split(SPACE_SIGN) if word]
+            line_meta: List[tuple[int, AnalysedDialog, int]] = []
             for line_idx in line_idxs:
                 cur = analysis.get(line_idx)
                 if not cur:
                     continue
-                temp = [words[0]] if words else [EMPTY_STRING]
-                k = 1
-                while (
-                    _any_less(_count_symbols(SPACE_SIGN.join(temp)), cur, only_end_symbols)
-                    or (_all_zeros(cur, without_word_count) and k < cur.get("wordCount", 0))
-                    or (
-                        _all_zeros(cur, without_non_end_symbols)
-                        and _any_less(_count_symbols(SPACE_SIGN.join(temp)), cur)
-                    )
-                ) and cur.get("wordCount", 0) > 1 and k < len(words):
-                    temp.append(words[k])
-                    k += 1
-                result[line_idx] = _restore_line(SPACE_SIGN.join(temp), cur)
-                words = words[k:]
+                word_count = int(cur.get("wordCount", 0) or 0)
+                line_meta.append((line_idx, cur, word_count))
+            lines_with_words = [meta for meta in line_meta if meta[2] > 0]
+            if words and lines_with_words:
+                weights = [meta[2] for meta in lines_with_words]
+                counts = _split_words_by_weights(words, weights)
+                offset = 0
+                for (line_idx, cur, _), count in zip(lines_with_words, counts):
+                    segment = words[offset : offset + count] if count > 0 else []
+                    offset += count
+                    result[line_idx] = _restore_line(SPACE_SIGN.join(segment), cur)
+            for line_idx, cur, word_count in line_meta:
+                if word_count <= 0 and line_idx not in result:
+                    result[line_idx] = _restore_line(EMPTY_STRING, cur)
         else:
             if not line_idxs:
                 continue

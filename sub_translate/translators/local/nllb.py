@@ -9,7 +9,7 @@ from sub_translate.constants import MODELS_DIR
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
 from sub_translate.utils.huggingface import TranslatorLoadError, load_model_components
-from sub_translate.translators.local_utils import MAX_MODEL_INPUT, MAX_OUTPUT_LENGTH, clear_gpu_memory, resolve_lang
+from sub_translate.utils.local_utils import MAX_MODEL_INPUT, MAX_OUTPUT_LENGTH, clear_gpu_memory, resolve_lang
 from sub_translate.utils.translation_utils import translate_text as translate_text_common
 
 DEFAULT_MODEL_NAME = "facebook/nllb-200-3.3B"

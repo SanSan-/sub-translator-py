@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, TypedDict
 
+from sub_translate.constants import (
+    SMART_SPLIT_MAX_CHARS,
+    SMART_SPLIT_MAX_DURATION_MS,
+    SMART_SPLIT_MAX_GAP_MS,
+    SMART_SPLIT_MAX_LINES,
+    SMART_SPLIT_MAX_WORDS,
+)
 
 @dataclass(slots=True)
 class SrtSubtitlesItem:
@@ -51,6 +58,15 @@ class TranslationOptions:
     detail: bool = False
 
 
+@dataclass(slots=True)
+class SmartSplitSettings:
+    max_lines: int = SMART_SPLIT_MAX_LINES
+    max_words: int = SMART_SPLIT_MAX_WORDS
+    max_chars: int = SMART_SPLIT_MAX_CHARS
+    max_gap_ms: int = SMART_SPLIT_MAX_GAP_MS
+    max_duration_ms: int = SMART_SPLIT_MAX_DURATION_MS
+
+
 class AnalysedLine(TypedDict, total=False):
     wordCount: int
     dotCount: int
@@ -83,4 +99,5 @@ __all__ = [
     "AnalysedDialog",
     "AnalysedItem",
     "TranslatedDialogItem",
+    "SmartSplitSettings",
 ]

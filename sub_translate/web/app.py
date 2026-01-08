@@ -17,8 +17,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from sub_translate.cli import resolve_io_paths
-from sub_translate.constants import LOGS_DIR
-from sub_translate.models import TranslationOptions
+from sub_translate.constants import (
+    LOGS_DIR,
+    SMART_SPLIT_MAX_CHARS,
+    SMART_SPLIT_MAX_DURATION_MS,
+    SMART_SPLIT_MAX_GAP_MS,
+    SMART_SPLIT_MAX_LINES,
+    SMART_SPLIT_MAX_WORDS,
+)
+from sub_translate.models import SmartSplitSettings, TranslationOptions
 from sub_translate.service import resolve_api, resolve_format, translate_subtitles
 from sub_translate.dictionaries.languages import LANGS, get_code
 from sub_translate.translators.agent import (
@@ -32,11 +39,11 @@ from sub_translate.translators.agent import (
     set_user_prompt_template,
 )
 from sub_translate.translators.agent_prompts import DEFAULT_PROMPT_VARIANT, get_prompt_template
-from sub_translate.translators.fsm import FsmTranslator
 from sub_translate.translators.google_web import GoogleWebTranslator
-from sub_translate.translators.madlad import MadladTranslator
-from sub_translate.translators.nllb import NllbTranslator, NllbLiteTranslator
-from sub_translate.translators.seamless import SeamlessTranslator
+from sub_translate.translators.local.fsm import FsmTranslator
+from sub_translate.translators.local.madlad import MadladTranslator
+from sub_translate.translators.local.nllb import NllbTranslator, NllbLiteTranslator
+from sub_translate.translators.local.seamless import SeamlessTranslator
 from sub_translate.utils.io_utils import read_text
 from sub_translate.utils.env_utils import load_env
 from sub_translate.utils.logging_utils import configure_rotating_logger
@@ -75,6 +82,12 @@ class TranslationSettings(BaseModel):
     threads: int = 3
     allow_cpu_fallback: bool = False
     smart_split: bool = False
+    force: bool = False
+    smart_split_max_lines: int = SMART_SPLIT_MAX_LINES
+    smart_split_max_words: int = SMART_SPLIT_MAX_WORDS
+    smart_split_max_chars: int = SMART_SPLIT_MAX_CHARS
+    smart_split_max_gap_ms: int = SMART_SPLIT_MAX_GAP_MS
+    smart_split_max_duration_ms: int = SMART_SPLIT_MAX_DURATION_MS
     tld: str = "com"
     timeout: int = 30
     request_delay_ms: int = 350
@@ -237,6 +250,12 @@ def _build_ui_config() -> dict[str, Any]:
             "batch_size": 21,
             "threads": 3,
             "allow_cpu_fallback": False,
+            "force": False,
+            "smart_split_max_lines": SMART_SPLIT_MAX_LINES,
+            "smart_split_max_words": SMART_SPLIT_MAX_WORDS,
+            "smart_split_max_chars": SMART_SPLIT_MAX_CHARS,
+            "smart_split_max_gap_ms": SMART_SPLIT_MAX_GAP_MS,
+            "smart_split_max_duration_ms": SMART_SPLIT_MAX_DURATION_MS,
             "tld": "com",
             "timeout": 30,
             "request_delay_ms": 350,
@@ -471,6 +490,8 @@ def _run_job(job: TranslationJob) -> None:
 
         total = len(job.paths)
         _emit_job_event(job, {"type": "job", "total": total})
+        if job.settings.force:
+            _emit_job_event(job, {"type": "log", "message": "Кеш перевода игнорируется (--force)."})
 
         for idx, path in enumerate(job.paths, start=1):
             _emit_job_event(job,
@@ -510,32 +531,42 @@ def _run_job(job: TranslationJob) -> None:
                     agent_model=job.settings.agent_model,
                     openai_api_key=job.settings.openai_api_key,
                 )
-                if apply_output_cache(
-                    path,
-                    output_path,
-                    api,
-                    job.settings.target_lang,
-                    file_format,
-                    logger,
-                ):
-                    _emit_job_event(job,
-                        {
-                            "type": "file",
-                            "path": str(path),
-                            "index": idx,
-                            "total": total,
-                            "state": "cached",
-                            "progress": 100,
-                            "output": str(output_path),
-                        }
+                smart_split_settings = None
+                if job.settings.smart_split:
+                    smart_split_settings = SmartSplitSettings(
+                        max_lines=job.settings.smart_split_max_lines,
+                        max_words=job.settings.smart_split_max_words,
+                        max_chars=job.settings.smart_split_max_chars,
+                        max_gap_ms=job.settings.smart_split_max_gap_ms,
+                        max_duration_ms=job.settings.smart_split_max_duration_ms,
                     )
-                    _emit_job_event(job,
-                        {
-                            "type": "log",
-                            "message": f"Файл {idx}/{total}: {path.name} - кеш.",
-                        }
-                    )
-                    continue
+                if not job.settings.force:
+                    if apply_output_cache(
+                        path,
+                        output_path,
+                        api,
+                        job.settings.target_lang,
+                        file_format,
+                        logger,
+                    ):
+                        _emit_job_event(job,
+                            {
+                                "type": "file",
+                                "path": str(path),
+                                "index": idx,
+                                "total": total,
+                                "state": "cached",
+                                "progress": 100,
+                                "output": str(output_path),
+                            }
+                        )
+                        _emit_job_event(job,
+                            {
+                                "type": "log",
+                                "message": f"Файл {idx}/{total}: {path.name} - кеш.",
+                            }
+                        )
+                        continue
 
                 def report_progress(processed: int, total_items: int) -> None:
                     if total_items <= 0:
@@ -563,6 +594,7 @@ def _run_job(job: TranslationJob) -> None:
                     thread_count=job.settings.threads,
                     batch_size=job.settings.batch_size,
                     smart_split=job.settings.smart_split,
+                    smart_split_settings=smart_split_settings,
                     timeout=job.settings.timeout,
                     logger=logger,
                     progress_callback=report_progress,
