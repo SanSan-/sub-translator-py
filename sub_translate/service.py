@@ -7,14 +7,19 @@ from typing import Callable, Dict, List
 
 from sub_translate.constants import DEFAULT_BATCH_SIZE, DEFAULT_THREAD_COUNT
 from sub_translate.enums import FileFormat
-from sub_translate.models import PrepareToTranslateItem, TranslatedItem, TranslationOptions
+from sub_translate.models import (
+    PrepareToTranslateItem,
+    SmartSplitSettings,
+    TranslatedItem,
+    TranslationOptions,
+)
 from sub_translate.translators.agent import AgentTranslator
 from sub_translate.translators.base import TranslationError, Translator
-from sub_translate.translators.fsm import FsmTranslator
 from sub_translate.translators.google_web import GoogleWebTranslator
-from sub_translate.translators.madlad import MadladTranslator
-from sub_translate.translators.nllb import NllbLiteTranslator, NllbTranslator
-from sub_translate.translators.seamless import SeamlessTranslator
+from sub_translate.translators.local.fsm import FsmTranslator
+from sub_translate.translators.local.madlad import MadladTranslator
+from sub_translate.translators.local.nllb import NllbLiteTranslator, NllbTranslator
+from sub_translate.translators.local.seamless import SeamlessTranslator
 from sub_translate.utils.io_utils import read_text, split_lines, write_lines
 from sub_translate.utils.line_utils import (
     analyse_lines,
@@ -88,6 +93,22 @@ def _translate_batches(
     logger: logging.Logger,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> List[TranslatedItem]:
+    def _apply_batch_result(
+        batch: List[PrepareToTranslateItem],
+        translations: List[str],
+        processed_count: int,
+        total_count: int,
+    ) -> int:
+        if len(translations) != len(batch):
+            raise TranslationError("Ответ переводчика не совпадает с размером пачки.")
+        for item, text in zip(batch, translations):
+            translated[item.idx] = TranslatedItem(idx=item.idx, text=text, lines=item.lines)
+        processed_count += len(batch)
+        logger.info("Переведено %s/%s", processed_count, total_count)
+        if progress_callback:
+            progress_callback(processed_count, total_count)
+        return processed_count
+
     total = len(prepare)
     if total == 0:
         return []
@@ -110,28 +131,14 @@ def _translate_batches(
                 for future in as_completed(future_map):
                     batch = future_map[future]
                     translations = future.result()
-                    if len(translations) != len(batch):
-                        raise TranslationError("Ответ переводчика не совпадает с размером пачки.")
-                    for item, text in zip(batch, translations):
-                        translated[item.idx] = TranslatedItem(idx=item.idx, text=text, lines=item.lines)
-                    processed += len(batch)
-                    logger.info("Переведено %s/%s", processed, total)
-                    if progress_callback:
-                        progress_callback(processed, total)
+                    processed = _apply_batch_result(batch, translations, processed, total)
         else:
             for batch in batches:
                 translations = translator.translate_batch(
                     [item.to_translate for item in batch],
                     options,
                 )
-                if len(translations) != len(batch):
-                    raise TranslationError("Ответ переводчика не совпадает с размером пачки.")
-                for item, text in zip(batch, translations):
-                    translated[item.idx] = TranslatedItem(idx=item.idx, text=text, lines=item.lines)
-                processed += len(batch)
-                logger.info("Переведено %s/%s", processed, total)
-                if progress_callback:
-                    progress_callback(processed, total)
+                processed = _apply_batch_result(batch, translations, processed, total)
     return [translated[idx] for idx in sorted(translated.keys())]
 
 
@@ -145,6 +152,7 @@ def translate_subtitles(
     thread_count: int,
     batch_size: int,
     smart_split: bool,
+    smart_split_settings: SmartSplitSettings | None = None,
     timeout: int,
     logger: logging.Logger,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -161,7 +169,7 @@ def translate_subtitles(
     else:
         raise TranslationError(f"Формат не поддерживается: {file_format}")
 
-    prepare = build_prepare(dialogs, smart_split)
+    prepare = build_prepare(dialogs, smart_split, smart_split_settings)
     analysis = analyse_lines(dialogs)
 
     translator = get_translator(api, timeout)

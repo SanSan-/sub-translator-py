@@ -31,9 +31,18 @@ const userPromptArea = document.getElementById("userPromptArea");
 const systemPromptStatus = document.getElementById("systemPromptStatus");
 const userPromptStatus = document.getElementById("userPromptStatus");
 const openAiKeyStatus = document.getElementById("openAiKeyStatus");
+const smartSplitInput = settingsForm.querySelector("[data-setting=\"smart_split\"]");
+const smartSplitControls = document.getElementById("smartSplitControls");
+const smartSplitSettingsBtn = document.getElementById("smartSplitSettingsBtn");
+const smartSplitModal = document.getElementById("smartSplitModal");
+const smartSplitStatus = document.getElementById("smartSplitStatus");
+const smartSplitInputs = smartSplitModal
+  ? Array.from(smartSplitModal.querySelectorAll("[data-setting]"))
+  : [];
 
 const SETTINGS_STORAGE_KEY = "subTranslateSettings";
 const allowCpuFallbackInput = settingsForm.querySelector("[data-setting=\"allow_cpu_fallback\"]");
+const forceCacheInput = settingsForm.querySelector("[data-setting=\"force\"]");
 
 const statusLabels = {
   idle: "ожидание",
@@ -212,6 +221,7 @@ function applyStoredSettings(stored) {
   setSelectValueIfExists(sourceLangSelect, stored.source_lang);
   setSelectValueIfExists(targetLangSelect, stored.target_lang);
   updatePromptStatus();
+  updateSmartSplitUi();
 }
 
 function updatePromptStatus() {
@@ -230,6 +240,88 @@ function updatePromptStatus() {
   openAiKeyStatus.textContent = apiKeyText
     ? `OpenAI ключ: ${apiKeyText.length} символов.`
     : "Ключ не задан.";
+}
+
+function readNumericValue(input) {
+  if (!input) {
+    return 0;
+  }
+  const parsed = Number.parseInt(input.value, 10);
+  if (Number.isFinite(parsed)) {
+    return parsed;
+  }
+  const fallback = Number.parseInt(input.defaultValue, 10);
+  return Number.isFinite(fallback) ? fallback : 0;
+}
+
+function updateSmartSplitStatus() {
+  if (!smartSplitStatus || smartSplitInputs.length === 0) {
+    return;
+  }
+  const values = {
+    smart_split_max_lines: readNumericValue(settingsForm.querySelector("[data-setting=\"smart_split_max_lines\"]")),
+    smart_split_max_words: readNumericValue(settingsForm.querySelector("[data-setting=\"smart_split_max_words\"]")),
+    smart_split_max_chars: readNumericValue(settingsForm.querySelector("[data-setting=\"smart_split_max_chars\"]")),
+    smart_split_max_gap_ms: readNumericValue(settingsForm.querySelector("[data-setting=\"smart_split_max_gap_ms\"]")),
+    smart_split_max_duration_ms: readNumericValue(
+      settingsForm.querySelector("[data-setting=\"smart_split_max_duration_ms\"]")
+    ),
+  };
+  smartSplitStatus.textContent = (
+    `Лимиты: строки=${values.smart_split_max_lines}, слова=${values.smart_split_max_words}, ` +
+    `символы=${values.smart_split_max_chars}, пауза=${values.smart_split_max_gap_ms} мс, ` +
+    `длительность=${values.smart_split_max_duration_ms} мс.`
+  );
+}
+
+function updateSmartSplitUi() {
+  if (!smartSplitControls || !smartSplitInput) {
+    return;
+  }
+  const isEnabled = smartSplitInput.checked;
+  smartSplitControls.hidden = !isEnabled;
+  if (!isEnabled && smartSplitModal) {
+    smartSplitModal.hidden = true;
+  }
+  updateSmartSplitStatus();
+}
+
+function openSmartSplitModal() {
+  if (!smartSplitModal) {
+    return;
+  }
+  const snapshot = {};
+  smartSplitInputs.forEach((input) => {
+    snapshot[input.dataset.setting] = input.value;
+  });
+  smartSplitModal.dataset.prevValue = JSON.stringify(snapshot);
+  smartSplitModal.hidden = false;
+  const firstInput = smartSplitInputs[0];
+  if (firstInput) {
+    firstInput.focus();
+  }
+}
+
+function closeSmartSplitModal(restore) {
+  if (!smartSplitModal) {
+    return;
+  }
+  if (restore) {
+    try {
+      const snapshot = JSON.parse(smartSplitModal.dataset.prevValue || "{}");
+      smartSplitInputs.forEach((input) => {
+        if (Object.prototype.hasOwnProperty.call(snapshot, input.dataset.setting)) {
+          input.value = snapshot[input.dataset.setting];
+        }
+      });
+    } catch (err) {
+      // игнорируем поврежденный снимок
+    }
+  }
+  smartSplitModal.hidden = true;
+  updateSmartSplitStatus();
+  persistSettings();
+  refreshDebounced();
 }
 
 function openPromptModal(modal, area) {
@@ -298,10 +390,35 @@ async function loadUiConfig() {
   setInputDefaults(settingsForm.querySelector("[data-setting=\"tld\"]"), defaults.tld || "com");
   setInputDefaults(settingsForm.querySelector("[data-setting=\"timeout\"]"), defaults.timeout || 30);
   setInputDefaults(settingsForm.querySelector("[data-setting=\"request_delay_ms\"]"), defaults.request_delay_ms || 350);
+  setInputDefaults(
+    settingsForm.querySelector("[data-setting=\"smart_split_max_lines\"]"),
+    defaults.smart_split_max_lines || 4
+  );
+  setInputDefaults(
+    settingsForm.querySelector("[data-setting=\"smart_split_max_words\"]"),
+    defaults.smart_split_max_words || 40
+  );
+  setInputDefaults(
+    settingsForm.querySelector("[data-setting=\"smart_split_max_chars\"]"),
+    defaults.smart_split_max_chars || 220
+  );
+  setInputDefaults(
+    settingsForm.querySelector("[data-setting=\"smart_split_max_gap_ms\"]"),
+    defaults.smart_split_max_gap_ms || 800
+  );
+  setInputDefaults(
+    settingsForm.querySelector("[data-setting=\"smart_split_max_duration_ms\"]"),
+    defaults.smart_split_max_duration_ms || 6000
+  );
   if (allowCpuFallbackInput) {
     const allowFallback = Boolean(defaults.allow_cpu_fallback);
     allowCpuFallbackInput.checked = allowFallback;
     allowCpuFallbackInput.defaultChecked = allowFallback;
+  }
+  if (forceCacheInput) {
+    const forceEnabled = Boolean(defaults.force);
+    forceCacheInput.checked = forceEnabled;
+    forceCacheInput.defaultChecked = forceEnabled;
   }
   if (systemPromptArea && config.agent_prompts) {
     systemPromptArea.value = config.agent_prompts.system || "";
@@ -322,6 +439,7 @@ async function loadUiConfig() {
     applyStoredSettings(stored);
   } else {
     updateApiDependentUi();
+    updateSmartSplitUi();
   }
 }
 
@@ -728,6 +846,12 @@ if (userPromptBtn) {
 if (openAiKeyBtn) {
   openAiKeyBtn.addEventListener("click", () => openPromptModal(openAiKeyModal, openAiKeyArea));
 }
+if (smartSplitSettingsBtn) {
+  smartSplitSettingsBtn.addEventListener("click", () => openSmartSplitModal());
+}
+if (smartSplitInput) {
+  smartSplitInput.addEventListener("change", () => updateSmartSplitUi());
+}
 
 document.addEventListener("click", (event) => {
   const target = event.target;
@@ -740,6 +864,9 @@ document.addEventListener("click", (event) => {
   if (target instanceof HTMLElement && target.dataset.modalClose === "openai") {
     closePromptModal(openAiKeyModal, openAiKeyArea, true);
   }
+  if (target instanceof HTMLElement && target.dataset.modalClose === "smart-split") {
+    closeSmartSplitModal(true);
+  }
   if (target instanceof HTMLElement && target.dataset.modalSave === "system") {
     closePromptModal(systemPromptModal, systemPromptArea, false);
   }
@@ -748,6 +875,9 @@ document.addEventListener("click", (event) => {
   }
   if (target instanceof HTMLElement && target.dataset.modalSave === "openai") {
     closePromptModal(openAiKeyModal, openAiKeyArea, false);
+  }
+  if (target instanceof HTMLElement && target.dataset.modalSave === "smart-split") {
+    closeSmartSplitModal(false);
   }
 });
 
@@ -773,6 +903,13 @@ if (openAiKeyModal) {
     }
   });
 }
+if (smartSplitModal) {
+  smartSplitModal.addEventListener("click", (event) => {
+    if (event.target === smartSplitModal) {
+      closeSmartSplitModal(true);
+    }
+  });
+}
 
 const refreshDebounced = debounce(() => {
   refreshCache().catch((err) => {
@@ -784,6 +921,12 @@ settingsForm.addEventListener("input", (event) => {
   const target = event.target;
   if (target instanceof HTMLElement && target.classList.contains("prompt-area")) {
     return;
+  }
+  if (target instanceof HTMLElement && target.dataset.setting === "smart_split") {
+    updateSmartSplitUi();
+  }
+  if (target instanceof HTMLElement && String(target.dataset.setting || "").startsWith("smart_split_")) {
+    updateSmartSplitStatus();
   }
   persistSettings();
   refreshDebounced();

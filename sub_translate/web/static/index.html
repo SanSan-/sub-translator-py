@@ -98,6 +98,19 @@
             <label>Умное объединение реплик</label>
             <input data-setting="smart_split" type="checkbox">
           </div>
+          <div id="smartSplitControls" class="field" hidden>
+            <label>Настройки умного объединения</label>
+            <div class="prompt-actions">
+              <button type="button" id="smartSplitSettingsBtn" class="btn ghost">Открыть</button>
+            </div>
+            <div class="prompt-meta">
+              <span id="smartSplitStatus">Лимиты не заданы.</span>
+            </div>
+          </div>
+          <div class="field toggle">
+            <label>Игнорировать кеш перевода</label>
+            <input data-setting="force" type="checkbox">
+          </div>
           <div class="field toggle">
             <label>Подробные логи</label>
             <input data-setting="verbose" type="checkbox">
@@ -153,6 +166,37 @@
               <div class="modal-actions">
                 <button type="button" class="btn ghost" data-modal-close="user">Отмена</button>
                 <button type="button" class="btn primary" data-modal-save="user">Сохранить</button>
+              </div>
+            </div>
+          </div>
+          <div id="smartSplitModal" class="modal" hidden>
+            <div class="modal-card">
+              <div class="modal-title">Умное объединение реплик</div>
+              <div class="grid-2">
+                <div class="field">
+                  <label>Максимум строк</label>
+                  <input data-setting="smart_split_max_lines" type="number" min="1">
+                </div>
+                <div class="field">
+                  <label>Максимум слов</label>
+                  <input data-setting="smart_split_max_words" type="number" min="1">
+                </div>
+                <div class="field">
+                  <label>Максимум символов</label>
+                  <input data-setting="smart_split_max_chars" type="number" min="1">
+                </div>
+                <div class="field">
+                  <label>Макс. пауза, мс</label>
+                  <input data-setting="smart_split_max_gap_ms" type="number" min="1">
+                </div>
+                <div class="field">
+                  <label>Макс. длительность, мс</label>
+                  <input data-setting="smart_split_max_duration_ms" type="number" min="1">
+                </div>
+              </div>
+              <div class="modal-actions">
+                <button type="button" class="btn ghost" data-modal-close="smart-split">Отмена</button>
+                <button type="button" class="btn primary" data-modal-save="smart-split">Сохранить</button>
               </div>
             </div>
           </div>

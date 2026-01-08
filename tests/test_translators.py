@@ -3,11 +3,11 @@ from unittest.mock import MagicMock, patch
 
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.agent import AgentTranslator
-from sub_translate.translators.fsm import FsmTranslator
 from sub_translate.translators.google_web import GoogleWebTranslator
-from sub_translate.translators.madlad import MadladTranslator
-from sub_translate.translators.nllb import NllbTranslator
-from sub_translate.translators.seamless import SeamlessTranslator
+from sub_translate.translators.local.fsm import FsmTranslator
+from sub_translate.translators.local.madlad import MadladTranslator
+from sub_translate.translators.local.nllb import NllbTranslator
+from sub_translate.translators.local.seamless import SeamlessTranslator
 
 
 def _setup_hf_mocks(mock_load):
@@ -56,7 +56,7 @@ class TestTranslators(unittest.TestCase):
             self.assertEqual(result, ["Привет", "Мир"])
             mock_request.assert_called()
 
-    @patch("sub_translate.translators.fsm.load_model_components")
+    @patch("sub_translate.translators.local.fsm.load_model_components")
     def test_fsm_translator(self, mock_load):
         _setup_hf_mocks(mock_load)
 
@@ -68,7 +68,7 @@ class TestTranslators(unittest.TestCase):
         self.assertEqual(result, ["Перевод", "Перевод"])
         mock_load.assert_called()
 
-    @patch("sub_translate.translators.madlad.load_model_components")
+    @patch("sub_translate.translators.local.madlad.load_model_components")
     def test_madlad_translator(self, mock_load):
         _setup_hf_mocks(mock_load)
 
@@ -78,7 +78,7 @@ class TestTranslators(unittest.TestCase):
         self.assertEqual(result, ["Перевод", "Перевод"])
         mock_load.assert_called()
 
-    @patch("sub_translate.translators.seamless.load_model_components")
+    @patch("sub_translate.translators.local.seamless.load_model_components")
     def test_seamless_translator(self, mock_load):
         _setup_hf_mocks(mock_load)
 
@@ -88,7 +88,7 @@ class TestTranslators(unittest.TestCase):
         self.assertEqual(result, ["Перевод", "Перевод"])
         mock_load.assert_called()
 
-    @patch("sub_translate.translators.nllb.load_model_components")
+    @patch("sub_translate.translators.local.nllb.load_model_components")
     def test_nllb_translator(self, mock_load):
         mock_tokenizer, mock_model, mock_device = _setup_hf_mocks(mock_load)
 

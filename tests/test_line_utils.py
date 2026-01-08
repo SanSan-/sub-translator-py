@@ -1,9 +1,17 @@
 import json
 from pathlib import Path
 
-from sub_translate.constants import EMPTY_STRING
+from sub_translate.constants import EMPTY_STRING, SMART_SPLIT_MAX_GAP_MS
+from sub_translate.models import SmartSplitSettings, SrtSubtitlesItem, TranslatedItem
 from sub_translate.utils.common_utils import is_empty_array, is_empty_object
-from sub_translate.utils.line_utils import build_prepare, clean_line, parse_ass_dialogs, parse_srt_dialogs
+from sub_translate.utils.line_utils import (
+    analyse_lines,
+    build_prepare,
+    build_translated_dialogs,
+    clean_line,
+    parse_ass_dialogs,
+    parse_srt_dialogs,
+)
 
 
 def _load_fixture(name: str) -> list[str]:
@@ -79,6 +87,24 @@ def test_clean_line_smart_wrapping_11() -> None:
     assert clean_line("What's this about?\\NThere's no need to be so polite.") == (
         "What's this about? There's no need to be so polite."
     )
+
+
+def test_clean_line_sentence_spacing() -> None:
+    assert clean_line("Если нам повезет, интервьюер перечислит все функции.Например, так.") == (
+        "Если нам повезет, интервьюер перечислит все функции. Например, так."
+    )
+
+
+def test_clean_line_sentence_spacing_questions() -> None:
+    assert clean_line("Что?Пойдём!") == "Что? Пойдём!"
+
+
+def test_clean_line_sentence_spacing_questions_en() -> None:
+    assert clean_line("What?No!") == "What? No!"
+
+
+def test_clean_line_url_preserved() -> None:
+    assert clean_line("Сайт example.com работает.") == "Сайт example.com работает."
 
 
 def test_clean_line_smart_wrapping_12() -> None:
@@ -476,34 +502,223 @@ def test_build_prepare_smart_splitter_off_free_movie() -> None:
 def test_build_prepare_smart_splitter_on_akebi() -> None:
     prepare = build_prepare(parse_ass_dialogs(_load_fixture("akebi11.ass.json")), True)
     assert not is_empty_array(prepare)
-    assert len(prepare) == 273
+    assert len(prepare) == 280
 
 
 def test_build_prepare_smart_splitter_on_bisco() -> None:
     prepare = build_prepare(parse_ass_dialogs(_load_fixture("bisco12.ass.json")), True)
     assert not is_empty_array(prepare)
-    assert len(prepare) == 227
+    assert len(prepare) == 254
 
 
 def test_build_prepare_smart_splitter_on_girlish() -> None:
     prepare = build_prepare(parse_ass_dialogs(_load_fixture("girlishNum10.ass.json")), True)
     assert not is_empty_array(prepare)
-    assert len(prepare) == 332
+    assert len(prepare) == 403
 
 
 def test_build_prepare_smart_splitter_on_hakozume() -> None:
     prepare = build_prepare(parse_ass_dialogs(_load_fixture("hakozume12.ass.json")), True)
     assert not is_empty_array(prepare)
-    assert len(prepare) == 370
+    assert len(prepare) == 375
 
 
 def test_build_prepare_smart_splitter_on_sono() -> None:
     prepare = build_prepare(parse_ass_dialogs(_load_fixture("sonoB12.ass.json")), True)
     assert not is_empty_array(prepare)
-    assert len(prepare) == 316
+    assert len(prepare) == 333
 
 
 def test_build_prepare_smart_splitter_on_free_movie() -> None:
     prepare = build_prepare(parse_srt_dialogs(_load_fixture("freeMovie.srt.json")), True)
     assert not is_empty_array(prepare)
-    assert len(prepare) == 1619
+    assert len(prepare) == 1633
+
+
+def test_build_prepare_smart_splitter_line_limit() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(start_time="00:00:00,000", end_time="00:00:00,500", text="Hello"),
+        2: SrtSubtitlesItem(start_time="00:00:00,600", end_time="00:00:01,000", text="World"),
+        3: SrtSubtitlesItem(start_time="00:00:01,100", end_time="00:00:01,500", text="Again"),
+        4: SrtSubtitlesItem(start_time="00:00:01,600", end_time="00:00:02,000", text="And"),
+        5: SrtSubtitlesItem(start_time="00:00:02,100", end_time="00:00:02,500", text="More"),
+    }
+    prepare = build_prepare(dialogs, True)
+    assert len(prepare) == 2
+    assert prepare[0].lines == [1, 2, 3, 4]
+    assert prepare[1].lines == [5]
+
+
+def test_build_prepare_smart_splitter_end_symbol_split() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(start_time="00:00:00,000", end_time="00:00:01,000", text="Hello world."),
+        2: SrtSubtitlesItem(start_time="00:00:01,100", end_time="00:00:02,000", text="Next line"),
+    }
+    prepare = build_prepare(dialogs, True)
+    assert len(prepare) == 2
+    assert prepare[0].lines == [1]
+    assert prepare[1].lines == [2]
+
+
+def test_build_prepare_smart_splitter_uppercase_split() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(start_time="00:00:00,000", end_time="00:00:00,500", text="we define requirements"),
+        2: SrtSubtitlesItem(start_time="00:00:00,600", end_time="00:00:01,000", text="still continue"),
+        3: SrtSubtitlesItem(start_time="00:00:01,100", end_time="00:00:01,600", text="For example we design"),
+        4: SrtSubtitlesItem(start_time="00:00:01,700", end_time="00:00:02,200", text="the system"),
+    }
+    settings = SmartSplitSettings(
+        max_lines=10,
+        max_words=100,
+        max_chars=1000,
+        max_gap_ms=9999,
+        max_duration_ms=99999,
+    )
+    prepare = build_prepare(dialogs, True, settings)
+    assert len(prepare) == 2
+    assert prepare[0].lines == [1, 2]
+    assert prepare[1].lines == [3, 4]
+
+
+def test_build_prepare_smart_splitter_word_limit() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(start_time="00:00:00,000", end_time="00:00:01,000", text="one two"),
+        2: SrtSubtitlesItem(start_time="00:00:01,100", end_time="00:00:02,000", text="three four"),
+        3: SrtSubtitlesItem(start_time="00:00:02,100", end_time="00:00:03,000", text="five"),
+    }
+    settings = SmartSplitSettings(
+        max_lines=10,
+        max_words=3,
+        max_chars=1000,
+        max_gap_ms=9999,
+        max_duration_ms=99999,
+    )
+    prepare = build_prepare(dialogs, True, settings)
+    assert len(prepare) == 2
+    assert prepare[0].lines == [1, 2]
+    assert prepare[1].lines == [3]
+
+
+def test_build_prepare_smart_splitter_char_limit() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(start_time="00:00:00,000", end_time="00:00:01,000", text="Hello"),
+        2: SrtSubtitlesItem(start_time="00:00:01,100", end_time="00:00:02,000", text="World!"),
+        3: SrtSubtitlesItem(start_time="00:00:02,100", end_time="00:00:03,000", text="Again"),
+    }
+    settings = SmartSplitSettings(
+        max_lines=10,
+        max_words=100,
+        max_chars=10,
+        max_gap_ms=9999,
+        max_duration_ms=99999,
+    )
+    prepare = build_prepare(dialogs, True, settings)
+    assert len(prepare) == 2
+    assert prepare[0].lines == [1, 2]
+    assert prepare[1].lines == [3]
+
+
+def test_build_prepare_smart_splitter_duration_limit() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(start_time="00:00:00,000", end_time="00:00:00,900", text="Hello"),
+        2: SrtSubtitlesItem(start_time="00:00:00,950", end_time="00:00:02,200", text="World"),
+        3: SrtSubtitlesItem(start_time="00:00:02,300", end_time="00:00:03,000", text="Again"),
+    }
+    settings = SmartSplitSettings(
+        max_lines=10,
+        max_words=100,
+        max_chars=1000,
+        max_gap_ms=9999,
+        max_duration_ms=1000,
+    )
+    prepare = build_prepare(dialogs, True, settings)
+    assert len(prepare) == 2
+    assert prepare[0].lines == [1, 2]
+    assert prepare[1].lines == [3]
+
+
+def test_build_translated_dialogs_comma_split() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(text="First part here"),
+        2: SrtSubtitlesItem(text="Second part here"),
+    }
+    analysis = analyse_lines(dialogs)
+    translated = [
+        TranslatedItem(
+            idx=0,
+            text="Alpha beta, gamma delta",
+            lines=[1, 2],
+        )
+    ]
+    result = build_translated_dialogs(translated, analysis)
+    assert result[1] == "Alpha beta,"
+    assert result[2] == "gamma delta"
+
+
+def test_build_translated_dialogs_weight_split() -> None:
+    dialogs = {
+        1: SrtSubtitlesItem(text="one two three"),
+        2: SrtSubtitlesItem(text="four"),
+    }
+    analysis = analyse_lines(dialogs)
+    translated = [
+        TranslatedItem(
+            idx=0,
+            text="a b c d e f g h",
+            lines=[1, 2],
+        )
+    ]
+    result = build_translated_dialogs(translated, analysis)
+    assert len(result[1].split()) == 6
+    assert len(result[2].split()) == 2
+
+
+def test_build_translated_dialogs_no_empty_lines() -> None:
+    dialogs = {
+        8: SrtSubtitlesItem(text="The system must allow application to exchange messages."),
+        9: SrtSubtitlesItem(text="non-functional requirements defined qualities of a system"),
+        10: SrtSubtitlesItem(text="how a System supposed to be"),
+        11: SrtSubtitlesItem(text="For example non-functional requirements for messaging system"),
+        12: SrtSubtitlesItem(text="may look like the following."),
+    }
+    analysis = analyse_lines(dialogs)
+    translated = [
+        TranslatedItem(
+            idx=0,
+            text=(
+                "Система должна разрешить приложению обмениваться сообщениями. "
+                "нефункциональные требования определяют качества системы, какой система должна быть"
+            ),
+            lines=[8, 9, 10],
+        ),
+        TranslatedItem(
+            idx=1,
+            text="Например, нефункциональные требования к системе обмена сообщениями могут выглядеть следующим образом.",
+            lines=[11, 12],
+        ),
+    ]
+    result = build_translated_dialogs(translated, analysis)
+    assert result[10].strip() != ""
+    assert result[12].strip() != ""
+
+
+def test_build_prepare_smart_splitter_gap_limit() -> None:
+    gap_ms = SMART_SPLIT_MAX_GAP_MS + 200
+    start_ms = 1000 + gap_ms
+    start_seconds = start_ms // 1000
+    start_millis = start_ms % 1000
+    end_ms = start_ms + 500
+    end_seconds = end_ms // 1000
+    end_millis = end_ms % 1000
+    dialogs = {
+        1: SrtSubtitlesItem(start_time="00:00:00,000", end_time="00:00:01,000", text="Hello"),
+        2: SrtSubtitlesItem(
+            start_time=f"00:00:{start_seconds:02d},{start_millis:03d}",
+            end_time=f"00:00:{end_seconds:02d},{end_millis:03d}",
+            text="World",
+        ),
+    }
+    prepare = build_prepare(dialogs, True)
+    assert len(prepare) == 2
+    assert prepare[0].lines == [1]
+    assert prepare[1].lines == [2]

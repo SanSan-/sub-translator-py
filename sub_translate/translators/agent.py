@@ -12,7 +12,7 @@ from typing import Dict, Optional
 from openai import OpenAI
 
 from sub_translate.utils.env_utils import load_env
-from sub_translate.translators.local_utils import clear_gpu_memory
+from sub_translate.utils.local_utils import clear_gpu_memory
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
 from sub_translate.constants import CACHE_DIR, PERSIST_DIR, TRANSLATOR_LOGS_DIR

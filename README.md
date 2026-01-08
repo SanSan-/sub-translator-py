@@ -16,11 +16,11 @@
 │  │  ├─ google_web.py               # перевод через Google Web RPC
 │  │  ├─ agent.py                    # перевод через OpenAI agent
 │  │  ├─ agent_prompts.py            # шаблоны подсказок для агента
-│  │  ├─ local_utils.py              # общая логика локальных моделей
-│  │  ├─ nllb.py                     # локальный переводчик NLLB
-│  │  ├─ seamless.py                 # локальный переводчик SeamlessM4T
-│  │  ├─ madlad.py                   # локальный переводчик MADLAD
-│  │  └─ fsm.py                      # локальный переводчик FSMT
+│  │  └─ local
+│  │     ├─ nllb.py                  # локальный переводчик NLLB
+│  │     ├─ seamless.py              # локальный переводчик SeamlessM4T
+│  │     ├─ madlad.py                # локальный переводчик MADLAD
+│  │     └─ fsm.py                   # локальный переводчик FSMT
 │  ├─ utils
 │  │  ├─ line_utils.py               # разбор/очистка/сборка строк субтитров
 │  │  ├─ validation_utils.py         # валидаторы форматов и регэкспы
@@ -29,6 +29,7 @@
 │  │  ├─ logging_utils.py            # конфигурация логирования
 │  │  ├─ env_utils.py                # загрузка переменных окружения
 │  │  ├─ huggingface.py              # загрузка и fallback HuggingFace-моделей
+│  │  ├─ local_utils.py              # общая логика локальных моделей
 │  │  ├─ path_utils.py               # утилиты разбора языкового суффикса
 │  │  └─ subtitle_cache.py           # кеш готовых переводов по имени файла
 │  ├─ web
@@ -80,6 +81,7 @@ python -m sub_translate \
   --threads 3 \
   --allow-cpu-fallback \
   --smart-split \
+  --force \
   --tld com \
   --timeout 30 \
   --agent-system-prompt-file path\to\system_prompt.txt \
@@ -100,6 +102,7 @@ python -m sub_translate \
 - `--threads` - число параллельных запросов (по умолчанию `3`, для локальных моделей фиксируется `1`).
 - `--allow-cpu-fallback` - разрешить переход на CPU при ошибках загрузки локальных моделей.
 - `--smart-split` - включить умное объединение реплик.
+- `--force` - игнорировать кеш перевода и перезаписать результат.
 - `--tld` - домен Google Translate (по умолчанию `com`).
 - `--timeout` - таймаут запроса в секундах (по умолчанию `30`).
 - `--agent-system-prompt-file` - файл системного промпта агента (UTF-8).
