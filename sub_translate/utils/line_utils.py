@@ -467,17 +467,47 @@ def build_effects(line: str) -> Dict[int, str]:
 
 
 def _count_symbols(text: str) -> AnalysedLine:
-    return {
-        "dotCount": count_regexp_entry(text, DOT_MASK),
-        "commaCount": count_regexp_entry(text, COMMA_MASK),
-        "quoteCount": count_regexp_entry(text, QUOTE_MASK),
-        "bracketCount": count_regexp_entry(text, BRACKET_MASK),
-        "dashCount": count_regexp_entry(text, DASH_MASK),
-        "colonCount": count_regexp_entry(text, COLON_MASK),
-        "semicolonCount": count_regexp_entry(text, SEMICOLON_MASK),
-        "questionMarkCount": count_regexp_entry(text, QUESTION_MARK_MASK),
-        "exclamationMarkCount": count_regexp_entry(text, EXCLAMATION_MARK_MASK),
+    counts = {
+        "dotCount": 0,
+        "commaCount": 0,
+        "quoteCount": 0,
+        "bracketCount": 0,
+        "dashCount": 0,
+        "colonCount": 0,
+        "semicolonCount": 0,
+        "questionMarkCount": 0,
+        "exclamationMarkCount": 0,
     }
+    for char in text:
+        if char == ".":
+            counts["dotCount"] += 1
+            continue
+        if char == ":":
+            counts["dotCount"] += 1
+            counts["colonCount"] += 1
+            continue
+        if char == ",":
+            counts["commaCount"] += 1
+            continue
+        if char == ";":
+            counts["semicolonCount"] += 1
+            continue
+        if char == "?":
+            counts["questionMarkCount"] += 1
+            continue
+        if char == "!":
+            counts["exclamationMarkCount"] += 1
+            continue
+        if char == "-":
+            counts["dashCount"] += 1
+            continue
+        if char in {"(", ")"}:
+            counts["bracketCount"] += 1
+            continue
+        if char in {'"', "<", ">"}:
+            counts["quoteCount"] += 1
+            continue
+    return counts
 
 
 def analyse_line(dialog_line: str) -> AnalysedDialog:
@@ -611,6 +641,7 @@ def _split_words_by_line(
     result: List[str],
 ) -> None:
     temp = list(words)
+    last_text_idx: int | None = None
     for i in range(lines_count):
         cur = lines[i]
         if not temp:
@@ -637,8 +668,16 @@ def _split_words_by_line(
             _add_effects(head, cur.get("effects", {}))
             result.append(SPACE_SIGN.join(head))
             temp = temp[j:]
+            last_text_idx = i
         else:
             result.append(EMPTY_STRING)
+    if temp and result:
+        tail = SPACE_SIGN.join(temp)
+        target_idx = last_text_idx if last_text_idx is not None else len(result) - 1
+        if result[target_idx]:
+            result[target_idx] = f"{result[target_idx]}{SPACE_SIGN}{tail}"
+        else:
+            result[target_idx] = tail
 
 
 def _restore_line(text: str, analysis: AnalysedDialog) -> str:

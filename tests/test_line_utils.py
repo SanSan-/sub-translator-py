@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from sub_translate.constants import EMPTY_STRING, SMART_SPLIT_MAX_GAP_MS
+from sub_translate.constants import BIG_NEW_LINE_SIGN, EMPTY_STRING, SMART_SPLIT_MAX_GAP_MS
 from sub_translate.models import SmartSplitSettings, SrtSubtitlesItem, TranslatedItem
 from sub_translate.utils.common_utils import is_empty_array, is_empty_object
 from sub_translate.utils.line_utils import (
@@ -101,6 +101,10 @@ def test_clean_line_sentence_spacing_questions() -> None:
 
 def test_clean_line_sentence_spacing_questions_en() -> None:
     assert clean_line("What?No!") == "What? No!"
+
+
+def test_clean_line_non_breaking_hyphen() -> None:
+    assert clean_line("request\u2011response") == "request-response"
 
 
 def test_clean_line_url_preserved() -> None:
@@ -722,3 +726,27 @@ def test_build_prepare_smart_splitter_gap_limit() -> None:
     assert len(prepare) == 2
     assert prepare[0].lines == [1]
     assert prepare[1].lines == [2]
+
+
+def test_build_translated_dialogs_agent_cache_not_truncated() -> None:
+    cached_text = (
+        "При проектировании системы, чтобы достичь качеств, о которых мы только что говорили, и программное, и"
+    )
+    dialogs = {
+        1: SrtSubtitlesItem(
+            text=(
+                "When designing a system, to achieve qualities"
+                f"{BIG_NEW_LINE_SIGN}we’ve just discussed, both software and"
+            )
+        ),
+    }
+    analysis = analyse_lines(dialogs)
+    translated = [
+        TranslatedItem(
+            idx=0,
+            text=cached_text,
+            lines=[1],
+        )
+    ]
+    result = build_translated_dialogs(translated, analysis)
+    assert clean_line(result[1]) == clean_line(cached_text)
