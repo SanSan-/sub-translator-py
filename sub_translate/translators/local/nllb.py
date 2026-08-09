@@ -5,16 +5,24 @@ import re
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from sub_translate.constants import MODELS_DIR
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
-from sub_translate.utils.huggingface import TranslatorLoadError, load_model_components
-from sub_translate.utils.local_utils import MAX_MODEL_INPUT, MAX_OUTPUT_LENGTH, clear_gpu_memory, resolve_lang
-from sub_translate.utils.translation_utils import translate_text as translate_text_common
-
-DEFAULT_MODEL_NAME = "facebook/nllb-200-3.3B"
-LITE_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
-MODEL_CACHE_DIR = MODELS_DIR
+from sub_translate.translators.registry import resolve_registered_model
+from sub_translate.utils.huggingface import (
+    ModelLoadOptions,
+    ResolvedLocalModel,
+    TranslatorLoadError,
+    load_model_components,
+)
+from sub_translate.utils.local_utils import (
+    MAX_MODEL_INPUT,
+    MAX_OUTPUT_LENGTH,
+    clear_gpu_memory,
+    resolve_lang,
+)
+from sub_translate.utils.translation_utils import (
+    translate_text as translate_text_common,
+)
 
 NLLB_LANGUAGE_ALIASES = {
     "en": "eng_Latn",
@@ -40,32 +48,48 @@ def _resolve_forced_bos(tokenizer: AutoTokenizer, target_lang: str) -> int:
 
 
 class _NllbEngine:
-    def __init__(self, model_name: str) -> None:
-        self._model_name = model_name
+    def __init__(self) -> None:
         self._tokenizer: AutoTokenizer | None = None
         self._model: AutoModelForSeq2SeqLM | None = None
         self._device: torch.device | None = None
         self._forced_bos_token_id: int | None = None
         self._current_lang_pair: tuple[str, str] | None = None
         self._allow_cpu_fallback = False
+        self._model_source: ResolvedLocalModel | None = None
 
-    def ensure_loaded(self, source_lang: str, target_lang: str, *, allow_cpu_fallback: bool = False) -> None:
+    def ensure_loaded(
+        self,
+        source_lang: str,
+        target_lang: str,
+        options: TranslationOptions | None = None,
+    ) -> None:
+        load_options = options or TranslationOptions()
+        model_source = resolve_registered_model("nllb-600m", load_options)
+        allow_cpu_fallback = bool(load_options.allow_cpu_fallback)
         if (
             self._tokenizer is None
             or self._model is None
             or self._device is None
             or self._allow_cpu_fallback != allow_cpu_fallback
+            or self._model_source != model_source
         ):
+            if self._tokenizer is not None or self._model is not None or self._device is not None:
+                self.unload()
             self._tokenizer, self._model, self._device = load_model_components(
-                self._model_name,
-                MODEL_CACHE_DIR,
+                str(model_source.path),
+                model_source.path,
                 AutoModelForSeq2SeqLM,
                 AutoTokenizer,
-                use_safetensors=True,
-                processor_kwargs={"use_fast": False},
-                allow_cpu_fallback=allow_cpu_fallback,
+                ModelLoadOptions(
+                    use_safetensors=False,
+                    allow_cpu_fallback=allow_cpu_fallback,
+                    enable_cpu_offload=allow_cpu_fallback,
+                    revision=model_source.revision,
+                    local_files_only=True,
+                ),
             )
             self._allow_cpu_fallback = allow_cpu_fallback
+            self._model_source = model_source
             self._forced_bos_token_id = None
             self._current_lang_pair = None
 
@@ -77,14 +101,12 @@ class _NllbEngine:
             self._forced_bos_token_id = _resolve_forced_bos(self._tokenizer, target_lang)
             self._current_lang_pair = (source_lang, target_lang)
 
-    def _token_count(self, text: str, source_lang: str, target_lang: str) -> int:
-        self.ensure_loaded(source_lang, target_lang, allow_cpu_fallback=self._allow_cpu_fallback)
+    def _token_count(self, text: str) -> int:
         assert self._tokenizer is not None
         encoded = self._tokenizer(text, return_tensors="pt", truncation=False)
         return encoded["input_ids"].shape[-1]
 
-    def _translate_chunk(self, text: str, source_lang: str, target_lang: str) -> str:
-        self.ensure_loaded(source_lang, target_lang, allow_cpu_fallback=self._allow_cpu_fallback)
+    def _translate_chunk(self, text: str) -> str:
         assert (
             self._tokenizer is not None
             and self._model is not None
@@ -110,16 +132,13 @@ class _NllbEngine:
             )
         return self._tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    def translate_text(self, text: str, source_lang: str, target_lang: str) -> str:
+    def translate_text(self, text: str) -> str:
         return translate_text_common(
             text=text,
             token_limit=MAX_MODEL_INPUT,
-            token_counter=lambda value: self._token_count(value, source_lang, target_lang),
-            chunk_translator=lambda value: self._translate_chunk(value, source_lang, target_lang),
+            token_counter=self._token_count,
+            chunk_translator=self._translate_chunk,
         )
-
-    def ensure_ready(self) -> None:
-        self.ensure_loaded(DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG, allow_cpu_fallback=False)
 
     def unload(self) -> None:
         self._tokenizer = None
@@ -128,22 +147,14 @@ class _NllbEngine:
         self._forced_bos_token_id = None
         self._current_lang_pair = None
         self._allow_cpu_fallback = False
+        self._model_source = None
         clear_gpu_memory()
 
 
-_DEFAULT_ENGINE = _NllbEngine(DEFAULT_MODEL_NAME)
-_LITE_ENGINE = _NllbEngine(LITE_MODEL_NAME)
+_ENGINE = _NllbEngine()
 
 
-def translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    return _DEFAULT_ENGINE.translate_text(text, source_lang, target_lang)
-
-
-def ensure_translator_ready() -> None:
-    _DEFAULT_ENGINE.ensure_ready()
-
-
-def _translate_batch(texts: list[str], options: TranslationOptions, engine: _NllbEngine, label: str) -> list[str]:
+def _translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
     if not texts:
         return []
     source_lang = resolve_lang(
@@ -164,48 +175,37 @@ def _translate_batch(texts: list[str], options: TranslationOptions, engine: _Nll
         model_label="NLLB",
         hint="Используйте код NLLB (например, eng_Latn) или алиас en/ru.",
     )
-    allow_cpu_fallback = bool(options.allow_cpu_fallback)
     try:
-        engine.ensure_loaded(source_lang, target_lang, allow_cpu_fallback=allow_cpu_fallback)
+        _ENGINE.ensure_loaded(source_lang, target_lang, options)
     except TranslatorLoadError as exc:
         raise TranslationError(str(exc)) from exc
     result: list[str] = []
     for text in texts:
         try:
-            result.append(engine.translate_text(text, source_lang, target_lang))
+            result.append(_ENGINE.translate_text(text))
+        except torch.cuda.OutOfMemoryError:
+            _ENGINE.unload()
+            raise TranslationError(
+                "NLLB 600M не хватило видеопамяти; модель выгружена, скрытый переход на CPU не выполнялся."
+            ) from None
         except Exception as exc:
-            raise TranslationError(f"Ошибка перевода через {label}: {exc}") from exc
+            raise TranslationError(f"Ошибка перевода через NLLB 600M: {exc}") from exc
     return result
 
 
-class NllbTranslator:
-    name = "nllb"
+class Nllb600MTranslator:
+    name = "nllb-600m"
 
     @staticmethod
     def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
-        return _translate_batch(texts, options, _DEFAULT_ENGINE, "NLLB")
+        return _translate_batch(texts, options)
 
     @staticmethod
     def unload() -> None:
-        _DEFAULT_ENGINE.unload()
-
-
-class NllbLiteTranslator:
-    name = "nllb-lite"
-
-    @staticmethod
-    def translate_batch(texts: list[str], options: TranslationOptions) -> list[str]:
-        return _translate_batch(texts, options, _LITE_ENGINE, "NLLB Lite")
-
-    @staticmethod
-    def unload() -> None:
-        _LITE_ENGINE.unload()
+        _ENGINE.unload()
 
 
 __all__ = [
-    "translate_text",
-    "ensure_translator_ready",
+    "Nllb600MTranslator",
     "TranslatorLoadError",
-    "NllbTranslator",
-    "NllbLiteTranslator",
 ]

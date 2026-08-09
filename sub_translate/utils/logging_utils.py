@@ -47,7 +47,7 @@ def configure_rotating_logger(
 
 
 __all__ = [
-    "configure_rotating_logger",
-    "LOG_MAX_BYTES",
     "LOG_BACKUP_COUNT",
+    "LOG_MAX_BYTES",
+    "configure_rotating_logger",
 ]

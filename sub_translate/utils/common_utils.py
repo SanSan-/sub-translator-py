@@ -17,4 +17,4 @@ def is_empty_array(value: Any) -> bool:
     return not (value and isinstance(value, list) and len(value) > 0)
 
 
-__all__ = ["is_empty", "is_empty_object", "is_empty_array"]
+__all__ = ["is_empty", "is_empty_array", "is_empty_object"]

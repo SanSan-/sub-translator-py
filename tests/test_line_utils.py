@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from sub_translate.constants import BIG_NEW_LINE_SIGN, EMPTY_STRING, SMART_SPLIT_MAX_GAP_MS
 from sub_translate.models import SmartSplitSettings, SrtSubtitlesItem, TranslatedItem
 from sub_translate.utils.common_utils import is_empty_array, is_empty_object
@@ -19,74 +21,102 @@ def _load_fixture(name: str) -> list[str]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_clean_line_smart_wrapping_1() -> None:
-    assert clean_line("For a sex crime, we use\\Na doll like this to reenact it.") == (
-        "For a sex crime, we use a doll like this to reenact it."
-    )
-
-
-def test_clean_line_smart_wrapping_2() -> None:
-    assert clean_line(
-        "--And, sure enough,\\Nthings didn't look right.\\N--It's 50 meters from the scene of\\Nthe crime to Hamaguchi Dental."
-    ) == (
-        "- And, sure enough, things didn't look right. - It's 50 meters from the scene of the crime to Hamaguchi Dental."
-    )
-
-
-def test_clean_line_smart_wrapping_3() -> None:
-    assert clean_line(
-        '"Ahh! The sergeants are\\Nabout to go at it again."\\N"Oh!" "Yamada-{\\i1}san {\\i0}is timing\\Nwhen to present his head!"'
-    ) == (
-        '"Ahh! The sergeants are about to go at it again." "Oh!" "Yamada-san is timing when to present his head!"'
-    )
-
-
-def test_clean_line_smart_wrapping_4() -> None:
-    assert clean_line(
-        "{\\move(320,140,303,140)\\bord0\\c&H705E5B&\\fs11\\frx14\\fry306\\frz356.1}Fukumoto Miki \\N\\NMusic Note Interior"
-    ) == "Fukumoto Miki Music Note Interior"
-
-
-def test_clean_line_smart_wrapping_5() -> None:
-    assert clean_line(
-        "{\\fs8\\pos(150,55)\\fay-.3\\frz2.928\\bord3}K\\Ni\\Nz\\Na\\Nk\\Ni\\N \\NE\\Nr\\Ni\\Nk\\Na"
-    ) == "Kizaki Erika"
-
-
-def test_clean_line_smart_wrapping_6() -> None:
-    assert clean_line("{\\pos(240,105)}W\\Na\\Ns\\Nh\\Ni\\No\\N \\NH\\Ni\\Nt\\No\\Nm\\Ni") == (
-        "Washio Hitomi"
-    )
-
-
-def test_clean_line_smart_wrapping_7() -> None:
-    assert clean_line("{\\pos(325,100)}N\\Na\\Nw\\Na\\Ns\\Nh\\Ni\\Nr\\No\\N \\NY\\Na\\Ns\\Nu\\Nk\\No") == (
-        "Nawashiro Yasuko"
-    )
-
-
-def test_clean_line_smart_wrapping_8() -> None:
-    assert clean_line("{\\pos(325,100)}\\NY\\Na\\Ns\\Nu\\Nk\\No N\\Na\\Nw\\Na\\Ns\\Nh\\Ni\\Nr\\No\\N") == (
-        "Yasuko Nawashiro"
-    )
-
-
-def test_clean_line_smart_wrapping_9() -> None:
-    assert clean_line("I'm gonna be in the cheer squad \\Nalong with Akebi-chan, you know...") == (
-        "I'm gonna be in the cheer squad along with Akebi-chan, you know:"
-    )
-
-
-def test_clean_line_smart_wrapping_10() -> None:
-    assert clean_line("What's this about? \\NThere's no need to be so polite.") == (
-        "What's this about? There's no need to be so polite."
-    )
-
-
-def test_clean_line_smart_wrapping_11() -> None:
-    assert clean_line("What's this about?\\NThere's no need to be so polite.") == (
-        "What's this about? There's no need to be so polite."
-    )
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "For a sex crime, we use\\Na doll like this to reenact it.",
+            "For a sex crime, we use a doll like this to reenact it.",
+        ),
+        (
+            "--And, sure enough,\\Nthings didn't look right.\\N--It's 50 meters from the scene of\\Nthe crime to Hamaguchi Dental.",
+            "- And, sure enough, things didn't look right. - It's 50 meters from the scene of the crime to Hamaguchi Dental.",
+        ),
+        (
+            '"Ahh! The sergeants are\\Nabout to go at it again."\\N"Oh!" "Yamada-{\\i1}san {\\i0}is timing\\Nwhen to present his head!"',
+            '"Ahh! The sergeants are about to go at it again." "Oh!" "Yamada-san is timing when to present his head!"',
+        ),
+        (
+            "{\\move(320,140,303,140)\\bord0\\c&H705E5B&\\fs11\\frx14\\fry306\\frz356.1}Fukumoto Miki \\N\\NMusic Note Interior",
+            "Fukumoto Miki Music Note Interior",
+        ),
+        (
+            "{\\fs8\\pos(150,55)\\fay-.3\\frz2.928\\bord3}K\\Ni\\Nz\\Na\\Nk\\Ni\\N \\NE\\Nr\\Ni\\Nk\\Na",
+            "Kizaki Erika",
+        ),
+        (
+            "{\\pos(240,105)}W\\Na\\Ns\\Nh\\Ni\\No\\N \\NH\\Ni\\Nt\\No\\Nm\\Ni",
+            "Washio Hitomi",
+        ),
+        (
+            "{\\pos(325,100)}N\\Na\\Nw\\Na\\Ns\\Nh\\Ni\\Nr\\No\\N \\NY\\Na\\Ns\\Nu\\Nk\\No",
+            "Nawashiro Yasuko",
+        ),
+        (
+            "{\\pos(325,100)}\\NY\\Na\\Ns\\Nu\\Nk\\No N\\Na\\Nw\\Na\\Ns\\Nh\\Ni\\Nr\\No\\N",
+            "Yasuko Nawashiro",
+        ),
+        (
+            "I'm gonna be in the cheer squad \\Nalong with Akebi-chan, you know...",
+            "I'm gonna be in the cheer squad along with Akebi-chan, you know:",
+        ),
+        (
+            "What's this about? \\NThere's no need to be so polite.",
+            "What's this about? There's no need to be so polite.",
+        ),
+        (
+            "What's this about?\\NThere's no need to be so polite.",
+            "What's this about? There's no need to be so polite.",
+        ),
+        (
+            "But that doesn't matter if you\\N can't keep the ball in the air.",
+            "But that doesn't matter if you can't keep the ball in the air.",
+        ),
+        (
+            "H-Hey, I'm just wishing out loud!\\N Don't be mad, okay?",
+            "H-Hey, I'm just wishing out loud! Don't be mad, okay?",
+        ),
+        (
+            "H-Hey, I'm just wishing out loud!\\NDon't be mad, okay?",
+            "H-Hey, I'm just wishing out loud! Don't be mad, okay?",
+        ),
+        (
+            '{\\fs8}2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) \\NShort Film "As We Accelerate" (Film Research Club) \\N4. Band Performance (Radical?Pop) \\N5. Dance (Drama Club: Akebi Komichi) \\N6. Catch the Rhythm! Medley of Popular Songs (Brass Band Club) \\NClosing Speech \\NAfter-Party Planning Committee President (Class 3-2 Hanasato Yuka) \\N\\N{\\fs12}Time: After the Athletic Festival\'s Closing Ceremony \\NPlace: Roubai Auditorium',
+            '2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) Short Film "As We Accelerate" (Film Research Club) 4. Band Performance (Radical?Pop) 5. Dance (Drama Club: Akebi Komichi) 6. Catch the Rhythm! Medley of Popular Songs (Brass Band Club) Closing Speech After-Party Planning Committee President (Class 3-2 Hanasato Yuka) Time: After the Athletic Festival\'s Closing Ceremony Place: Roubai Auditorium',
+        ),
+        (
+            'Roubai Academy Athletic Festival \\N\\N{\\fs16}After-Party \\N\\N{\\fs12}Program \\N\\N{\\fs8}\x07 Opening Speech \x07\\NAfter-Party Planning Committee Vice President\\N (Class 3-4 Takayama Haru) \\N\\N\x07 Stage Program \x07\\N1. Quiz Competition:\\N "How Many Do You Know?! Secrets of Roubai Academy" \\N(After-Party Planning Committee) \\N2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) \\NShort Film "As We Accelerate" (Film Research Club) \\N4. Band Performance (Radical?Pop) \\N5. Dance (Drama Club: Akebi Komichi)',
+            'Roubai Academy Athletic Festival After-Party Program \x07 Opening Speech \x07 After-Party Planning Committee Vice President (Class 3-4 Takayama Haru) \x07 Stage Program \x07 1. Quiz Competition: "How Many Do You Know?! Secrets of Roubai Academy" (After-Party Planning Committee) 2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) Short Film "As We Accelerate" (Film Research Club) 4. Band Performance (Radical?Pop) 5. Dance (Drama Club: Akebi Komichi)',
+        ),
+        (
+            '{\\an8}"First Investigation Division"\\NWhat is this, an invitational\\Nhard-boiled tournament?!',
+            '"First Investigation Division" What is this, an invitational hard-boiled tournament?!',
+        ),
+        (
+            "--I'm outta here.\\N--It does get tense, when it comes\\Nto HQ's First Investigation Division.",
+            "- I'm outta here. - It does get tense, when it comes to HQ's First Investigation Division.",
+        ),
+        (
+            "Hold on! Hold on! Hold on, dummy!\\NI'm doing my best here, too!",
+            "Hold on! Hold on! Hold on, dummy! I'm doing my best here, too!",
+        ),
+        (
+            "{\\an8\\b1\\blur0.4\\shad0\\fs26\\bord1.5\\c&H2400D3&\\3c&HDDD9F5&\\pos(542.667,21.334)}Declares \\NIndependence \\Nfrom the \\NJapanese\\NGovernment",
+            "Declares Independence from the Japanese Government",
+        ),
+        (
+            "{\\an8\\b1\\blur0.4\\fax-0.07\\shad0\\bord1.2\\c&H2400D3&\\3c&HDDD9F5&\\frz7.875\\pos(172,142.666)}New Governor\\N{\\fs42}Nekoyanagi\\N Pawoo",
+            "New Governor Nekoyanagi Pawoo",
+        ),
+        ("Hey, Mako- <i>chan</i> , do you have a wish?", "Hey, Mako- chan , do you have a wish?"),
+        (
+            "It's all right. Let's give it our all, Rei- <i>chan</i> !",
+            "It's all right. Let's give it our all, Rei- chan !",
+        ),
+    ],
+)
+def test_clean_line_smart_wrapping(source: str, expected: str) -> None:
+    assert clean_line(source) == expected
 
 
 def test_clean_line_sentence_spacing() -> None:
@@ -111,96 +141,22 @@ def test_clean_line_url_preserved() -> None:
     assert clean_line("Сайт example.com работает.") == "Сайт example.com работает."
 
 
-def test_clean_line_smart_wrapping_12() -> None:
-    assert clean_line("But that doesn't matter if you\\N can't keep the ball in the air.") == (
-        "But that doesn't matter if you can't keep the ball in the air."
-    )
-
-
-def test_clean_line_smart_wrapping_13() -> None:
-    assert clean_line("H-Hey, I'm just wishing out loud!\\N Don't be mad, okay?") == (
-        "H-Hey, I'm just wishing out loud! Don't be mad, okay?"
-    )
-
-
-def test_clean_line_smart_wrapping_14() -> None:
-    assert clean_line("H-Hey, I'm just wishing out loud!\\NDon't be mad, okay?") == (
-        "H-Hey, I'm just wishing out loud! Don't be mad, okay?"
-    )
-
-
-def test_clean_line_smart_wrapping_15() -> None:
-    assert clean_line(
-        "{\\fs8}2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) \\NShort Film \"As We Accelerate\" (Film Research Club) \\N4. Band Performance (Radical?Pop) \\N5. Dance (Drama Club: Akebi Komichi) \\N6. Catch the Rhythm! Medley of Popular Songs (Brass Band Club) \\NClosing Speech \\NAfter-Party Planning Committee President (Class 3-2 Hanasato Yuka) \\N\\N{\\fs12}Time: After the Athletic Festival's Closing Ceremony \\NPlace: Roubai Auditorium"
-    ) == (
-        "2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) Short Film \"As We Accelerate\" (Film Research Club) 4. Band Performance (Radical?Pop) 5. Dance (Drama Club: Akebi Komichi) 6. Catch the Rhythm! Medley of Popular Songs (Brass Band Club) Closing Speech After-Party Planning Committee President (Class 3-2 Hanasato Yuka) Time: After the Athletic Festival's Closing Ceremony Place: Roubai Auditorium"
-    )
-
-
-def test_clean_line_smart_wrapping_16() -> None:
-    assert clean_line(
-        "Roubai Academy Athletic Festival \\N\\N{\\fs16}After-Party \\N\\N{\\fs12}Program \\N\\N{\\fs8}\x07 Opening Speech \x07\\NAfter-Party Planning Committee Vice President\\N (Class 3-4 Takayama Haru) \\N\\N\x07 Stage Program \x07\\N1. Quiz Competition:\\N \"How Many Do You Know?! Secrets of Roubai Academy\" \\N(After-Party Planning Committee) \\N2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) \\NShort Film \"As We Accelerate\" (Film Research Club) \\N4. Band Performance (Radical?Pop) \\N5. Dance (Drama Club: Akebi Komichi)"
-    ) == (
-        "Roubai Academy Athletic Festival After-Party Program \x07 Opening Speech \x07 After-Party Planning Committee Vice President (Class 3-4 Takayama Haru) \x07 Stage Program \x07 1. Quiz Competition: \"How Many Do You Know?! Secrets of Roubai Academy\" (After-Party Planning Committee) 2. Acoustic Guitar and Singing (Class 2-3 Soumi Ruri) Short Film \"As We Accelerate\" (Film Research Club) 4. Band Performance (Radical?Pop) 5. Dance (Drama Club: Akebi Komichi)"
-    )
-
-
-def test_clean_line_smart_wrapping_17() -> None:
-    assert clean_line("{\\an8}\"First Investigation Division\"\\NWhat is this, an invitational\\Nhard-boiled tournament?!") == (
-        '"First Investigation Division" What is this, an invitational hard-boiled tournament?!'
-    )
-
-
-def test_clean_line_smart_wrapping_18() -> None:
-    assert clean_line("--I'm outta here.\\N--It does get tense, when it comes\\Nto HQ's First Investigation Division.") == (
-        "- I'm outta here. - It does get tense, when it comes to HQ's First Investigation Division."
-    )
-
-
-def test_clean_line_smart_wrapping_19() -> None:
-    assert clean_line("Hold on! Hold on! Hold on, dummy!\\NI'm doing my best here, too!") == (
-        "Hold on! Hold on! Hold on, dummy! I'm doing my best here, too!"
-    )
-
-
-def test_clean_line_smart_wrapping_20() -> None:
-    assert clean_line(
-        "{\\an8\\b1\\blur0.4\\shad0\\fs26\\bord1.5\\c&H2400D3&\\3c&HDDD9F5&\\pos(542.667,21.334)}Declares \\NIndependence \\Nfrom the \\NJapanese\\NGovernment"
-    ) == "Declares Independence from the Japanese Government"
-
-
-def test_clean_line_smart_wrapping_21() -> None:
-    assert clean_line(
-        "{\\an8\\b1\\blur0.4\\fax-0.07\\shad0\\bord1.2\\c&H2400D3&\\3c&HDDD9F5&\\frz7.875\\pos(172,142.666)}New Governor\\N{\\fs42}Nekoyanagi\\N Pawoo"
-    ) == "New Governor Nekoyanagi Pawoo"
-
-
-def test_clean_line_smart_wrapping_22() -> None:
-    assert clean_line("Hey, Mako- <i>chan</i> , do you have a wish?") == (
-        "Hey, Mako- chan , do you have a wish?"
-    )
-
-
-def test_clean_line_smart_wrapping_23() -> None:
-    assert clean_line("It's all right. Let's give it our all, Rei- <i>chan</i> !") == (
-        "It's all right. Let's give it our all, Rei- chan !"
-    )
-
-
-def test_clean_line_double_spaces_1() -> None:
-    assert clean_line('          "Victim"            "Suspect"        ') == '"Victim" "Suspect"'
-
-
-def test_clean_line_double_spaces_2() -> None:
-    assert clean_line(
-        "{\\an7\\fs85\\1c&H433A3C&\\pos(102,344)\\frz345.7}Вас ждёт решающий день\\N{\\fs25} \\N{\\fs85} Постарайтесь!"
-    ) == "Вас ждёт решающий день Постарайтесь!"
-
-
-def test_clean_line_double_spaces_3() -> None:
-    assert clean_line(
-        "{\\move(602,686,602,576,0,398)\\clip(572,552,1168,692)}Нисиката повержен!\\N\\N\\N Нисиката всё ещё смущается."
-    ) == "Нисиката повержен! Нисиката всё ещё смущается."
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('          "Victim"            "Suspect"        ', '"Victim" "Suspect"'),
+        (
+            "{\\an7\\fs85\\1c&H433A3C&\\pos(102,344)\\frz345.7}Вас ждёт решающий день\\N{\\fs25} \\N{\\fs85} Постарайтесь!",
+            "Вас ждёт решающий день Постарайтесь!",
+        ),
+        (
+            "{\\move(602,686,602,576,0,398)\\clip(572,552,1168,692)}Нисиката повержен!\\N\\N\\N Нисиката всё ещё смущается.",
+            "Нисиката повержен! Нисиката всё ещё смущается.",
+        ),
+    ],
+)
+def test_clean_line_double_spaces(source: str, expected: str) -> None:
+    assert clean_line(source) == expected
 
 
 def test_clean_line_bold() -> None:
@@ -230,9 +186,12 @@ def test_clean_line_shadow() -> None:
 
 
 def test_clean_line_comments() -> None:
-    assert clean_line(
-        "{\\fad(0,650)\\blur5\\an5\\pos(640,510)\\alpha&HFFF\\t(0,450,\\alpha&H777)}На {\\c&H9e55e8&}Зад{\\c}ней {\\c&H9e55e8&}Пар{\\c}те {Нет, серьёзно, это же Зазнайкина и Бармалейкин в японской реальности, спустя 40 лет}"
-    ) == "На Задней Парте"
+    assert (
+        clean_line(
+            "{\\fad(0,650)\\blur5\\an5\\pos(640,510)\\alpha&HFFF\\t(0,450,\\alpha&H777)}На {\\c&H9e55e8&}Зад{\\c}ней {\\c&H9e55e8&}Пар{\\c}те {Нет, серьёзно, это же Зазнайкина и Бармалейкин в японской реальности, спустя 40 лет}"
+        )
+        == "На Задней Парте"
+    )
 
 
 def test_clean_line_blur_edges() -> None:
@@ -260,9 +219,7 @@ def test_clean_line_spacing() -> None:
 
 
 def test_clean_line_rotation() -> None:
-    assert clean_line("{\\frz359.9\\fax-0.1\\frx.354\\fry2}Mebaeru to amaku omotteta") == (
-        "Mebaeru to amaku omotteta"
-    )
+    assert clean_line("{\\frz359.9\\fax-0.1\\frx.354\\fry2}Mebaeru to amaku omotteta") == ("Mebaeru to amaku omotteta")
 
 
 def test_clean_line_color() -> None:
@@ -300,25 +257,29 @@ def test_clean_line_alignment() -> None:
 
 
 def test_clean_line_numpad_layout() -> None:
-    assert clean_line("{\\an8}\"Police in a Pod\"") == '"Police in a Pod"'
+    assert clean_line('{\\an8}"Police in a Pod"') == '"Police in a Pod"'
 
 
 def test_clean_line_karaoke_words() -> None:
-    assert clean_line(" {\\k94}This {\\k48}is {\\k24}a {\\k150}karaoke {\\k94}line") == (
-        "This is a karaoke line"
-    )
+    assert clean_line(" {\\k94}This {\\k48}is {\\k24}a {\\k150}karaoke {\\k94}line") == ("This is a karaoke line")
 
 
 def test_clean_line_karaoke_fill() -> None:
-    assert clean_line(
-        "{\\K50}Kan{\\K25}chi{\\K45}ga{\\K40}i  {\\kf}sa{\\kf}re{\\kf}cha{\\kf}tta{\\kf}tte  {\\K75}ii  {\\K35}yo"
-    ) == "Kanchigai sarechattatte ii yo"
+    assert (
+        clean_line(
+            "{\\K50}Kan{\\K25}chi{\\K45}ga{\\K40}i  {\\kf}sa{\\kf}re{\\kf}cha{\\kf}tta{\\kf}tte  {\\K75}ii  {\\K35}yo"
+        )
+        == "Kanchigai sarechattatte ii yo"
+    )
 
 
 def test_clean_line_karaoke_outline() -> None:
-    assert clean_line(
-        "{\\ko30}Ko{\\ko30}tei  {\\ko20}de  {\\ko35}ki{\\ko35}mi  {\\ko30}no  {\\ko30}ko{\\ko30}to{\\ko30}ba"
-    ) == "Kotei de kimi no kotoba"
+    assert (
+        clean_line(
+            "{\\ko30}Ko{\\ko30}tei  {\\ko20}de  {\\ko35}ki{\\ko35}mi  {\\ko30}no  {\\ko30}ko{\\ko30}to{\\ko30}ba"
+        )
+        == "Kotei de kimi no kotoba"
+    )
 
 
 def test_clean_line_wrapping_style() -> None:
@@ -326,9 +287,12 @@ def test_clean_line_wrapping_style() -> None:
 
 
 def test_clean_line_cancel_overrides() -> None:
-    assert clean_line(
-        "{\\q2\\blur1.1\\frx18\\fry358\\org(428.4,167.2)\\frz0.6719\\pos(319.6,285.6)\\clip(184,296,428.8,328)}П{\\blur.9}р{\\blur.6}ямая {\\rDefault}трансляция"
-    ) == "Прямая трансляция"
+    assert (
+        clean_line(
+            "{\\q2\\blur1.1\\frx18\\fry358\\org(428.4,167.2)\\frz0.6719\\pos(319.6,285.6)\\clip(184,296,428.8,328)}П{\\blur.9}р{\\blur.6}ямая {\\rDefault}трансляция"
+        )
+        == "Прямая трансляция"
+    )
 
 
 def test_clean_line_wrong_symbol_in_effects() -> None:
@@ -336,39 +300,46 @@ def test_clean_line_wrong_symbol_in_effects() -> None:
 
 
 def test_clean_line_animation_1() -> None:
-    assert clean_line(
-        "{\\c&HD5C5F5&\\3c&H9A60E4&\\t(355,355,(\\c&H524C48&))\\t(355,355,(\\3c&HFFFFFF&))\\t(1523,1523,(\\c&HE7B592&))\\t(1523,1523,(\\3c&HB86F62&))\\t(1857,1857,(\\c&H524C48&))\\t(1857,1857,(\\3c&HFFFFFF&))}Чтобы зазвучал (на весь белый свет)"
-    ) == "Чтобы зазвучал (на весь белый свет)"
-
-
-def test_clean_line_animation_2() -> None:
-    assert clean_line(
-        "Fure! {\\alpha&HFF\\t(290,-15,\\alpha&H00)}Fure! {\\alpha&HFF\\t(580,-15,\\alpha&H00)}Fure! {\\alpha&HFF\\t(880,-15,\\alpha&H00)}?"
-    ) == "Fure! Fure! Fure! ?"
-
-
-def test_clean_line_animation_3() -> None:
-    assert clean_line("{\\fad(0,2000)\\c&H8E61C3&\\t(4071,0,(\\fs44)}Koete saku darou") == (
-        "Koete saku darou"
+    assert (
+        clean_line(
+            "{\\c&HD5C5F5&\\3c&H9A60E4&\\t(355,355,(\\c&H524C48&))\\t(355,355,(\\3c&HFFFFFF&))\\t(1523,1523,(\\c&HE7B592&))\\t(1523,1523,(\\3c&HB86F62&))\\t(1857,1857,(\\c&H524C48&))\\t(1857,1857,(\\3c&HFFFFFF&))}Чтобы зазвучал (на весь белый свет)"
+        )
+        == "Чтобы зазвучал (на весь белый свет)"
     )
 
 
-def test_clean_line_movement_1() -> None:
-    assert clean_line(
-        "{\\move(640,60,639.822,20.178,26,2528)}(Kizuita n da ne? Hajimaru yo)"
-    ) == "(Kizuita n da ne? Hajimaru yo)"
+def test_clean_line_animation_2() -> None:
+    assert (
+        clean_line(
+            "Fure! {\\alpha&HFF\\t(290,-15,\\alpha&H00)}Fure! {\\alpha&HFF\\t(580,-15,\\alpha&H00)}Fure! {\\alpha&HFF\\t(880,-15,\\alpha&H00)}?"
+        )
+        == "Fure! Fure! Fure! ?"
+    )
 
 
-def test_clean_line_movement_2() -> None:
-    assert clean_line(
-        "{\\q2\\blur1\\frz270\\move(115,83,115,-573)}Очарован и в состоянии\\Nстать кем-угодно и чем-угодно"
-    ) == "Очарован и в состоянии стать кем-угодно и чем-угодно"
+def test_clean_line_animation_3() -> None:
+    assert clean_line("{\\fad(0,2000)\\c&H8E61C3&\\t(4071,0,(\\fs44)}Koete saku darou") == ("Koete saku darou")
 
 
-def test_clean_line_movement_3() -> None:
-    assert clean_line(
-        "{\\q2\\bord1.5\\fs42\\blur1.5\\move(2994,658,-1700,658,27,26701)\\c&HF9F8F7&\\3c&H111111&}Первый том Blu-ray&DVD выйдет 21 декабря"
-    ) == "Первый том Blu-ray&DVD выйдет 21 декабря"
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "{\\move(640,60,639.822,20.178,26,2528)}(Kizuita n da ne? Hajimaru yo)",
+            "(Kizuita n da ne? Hajimaru yo)",
+        ),
+        (
+            "{\\q2\\blur1\\frz270\\move(115,83,115,-573)}Очарован и в состоянии\\Nстать кем-угодно и чем-угодно",
+            "Очарован и в состоянии стать кем-угодно и чем-угодно",
+        ),
+        (
+            "{\\q2\\bord1.5\\fs42\\blur1.5\\move(2994,658,-1700,658,27,26701)\\c&HF9F8F7&\\3c&H111111&}Первый том Blu-ray&DVD выйдет 21 декабря",
+            "Первый том Blu-ray&DVD выйдет 21 декабря",
+        ),
+    ],
+)
+def test_clean_line_movement(source: str, expected: str) -> None:
+    assert clean_line(source) == expected
 
 
 def test_clean_line_position() -> None:
@@ -376,9 +347,7 @@ def test_clean_line_position() -> None:
 
 
 def test_clean_line_move_origin() -> None:
-    assert clean_line("{\\blur1\\c&fafafa&\\pos(636,677)\\org(636,679)}Yumemiyo otome") == (
-        "Yumemiyo otome"
-    )
+    assert clean_line("{\\blur1\\c&fafafa&\\pos(636,677)\\org(636,679)}Yumemiyo otome") == ("Yumemiyo otome")
 
 
 def test_clean_line_fade_1() -> None:
@@ -392,15 +361,17 @@ def test_clean_line_fade_2() -> None:
 
 
 def test_clean_line_fade_3() -> None:
-    assert clean_line(
-        "{\\fade(&HFF, &HEE, &H00, 0, 500, 350, 2000)\\c&H8E61C3&\\t(4071,0,(\\fs44)}И надеждой расцветём."
-    ) == "И надеждой расцветём."
+    assert (
+        clean_line("{\\fade(&HFF, &HEE, &H00, 0, 500, 350, 2000)\\c&H8E61C3&\\t(4071,0,(\\fs44)}И надеждой расцветём.")
+        == "И надеждой расцветём."
+    )
 
 
 def test_clean_line_clip_1() -> None:
-    assert clean_line(
-        "{\\move(602,570,602,525,571,738)\\clip(572,552,1168,692)}Такаги-сан дразнит его."
-    ) == "Такаги-сан дразнит его."
+    assert (
+        clean_line("{\\move(602,570,602,525,571,738)\\clip(572,552,1168,692)}Такаги-сан дразнит его.")
+        == "Такаги-сан дразнит его."
+    )
 
 
 def test_clean_line_clip_2() -> None:
@@ -410,9 +381,12 @@ def test_clean_line_clip_2() -> None:
 
 
 def test_clean_line_drawings_1() -> None:
-    assert clean_line(
-        "{\\fad(250,250)\\an7\\pos(783,114)\\1c&Hfafafa&\\p1\\fscx25\\fscy25}{SSA logo#рамка}m 294 294.02 l 455.98 294.02 455.98 456 294 456  m 312.34 312.36 l 312.34 437.66 437.64 437.66 437.64 312.36"
-    ) == EMPTY_STRING
+    assert (
+        clean_line(
+            "{\\fad(250,250)\\an7\\pos(783,114)\\1c&Hfafafa&\\p1\\fscx25\\fscy25}{SSA logo#рамка}m 294 294.02 l 455.98 294.02 455.98 456 294 456  m 312.34 312.36 l 312.34 437.66 437.64 437.66 437.64 312.36"
+        )
+        == EMPTY_STRING
+    )
 
 
 def test_clean_line_drawings_2() -> None:
@@ -422,9 +396,12 @@ def test_clean_line_drawings_2() -> None:
 
 
 def test_clean_line_baseline_offset_up() -> None:
-    assert clean_line(
-        "{\\blur1\\1c&H171719&\\pbo-34\\pos(96,244)\\iclip(m 286 236 l 248 284 192 230)}m 0 0 l 190 0 190 55 0 55"
-    ) == EMPTY_STRING
+    assert (
+        clean_line(
+            "{\\blur1\\1c&H171719&\\pbo-34\\pos(96,244)\\iclip(m 286 236 l 248 284 192 230)}m 0 0 l 190 0 190 55 0 55"
+        )
+        == EMPTY_STRING
+    )
 
 
 def test_clean_line_baseline_offset_down() -> None:

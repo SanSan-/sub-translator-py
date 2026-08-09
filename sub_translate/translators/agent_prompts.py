@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from textwrap import dedent
-from typing import Dict
 
 DEFAULT_PROMPT_VARIANT = "default"
 BATCH_PROMPT_VARIANT = "batch"
 
-PROMPT_VARIANTS: Dict[str, str] = {
+PROMPT_VARIANTS: dict[str, str] = {
     DEFAULT_PROMPT_VARIANT: dedent(
         """
-        Переведи текст на русский. Сохрани количество строк и переносы строк.
+        Переведи текст с языка {source_lang} на язык {target_lang}.
+        Сохрани количество строк и переносы строк.
 
         Верни только перевод, без тегов.
 
@@ -23,7 +23,8 @@ PROMPT_VARIANTS: Dict[str, str] = {
     ).strip(),
     BATCH_PROMPT_VARIANT: dedent(
         """
-        Переведи текст на русский. Сохрани количество строк и переносы строк.
+        Переведи текст с языка {source_lang} на язык {target_lang}.
+        Сохрани количество строк и переносы строк.
 
         Текст разбит на блоки. Между блоками стоит строка-разделитель:
         {separator}
@@ -49,8 +50,8 @@ def get_prompt_template(variant: str) -> str:
 
 
 __all__ = [
-    "DEFAULT_PROMPT_VARIANT",
     "BATCH_PROMPT_VARIANT",
+    "DEFAULT_PROMPT_VARIANT",
     "PROMPT_VARIANTS",
     "get_prompt_template",
 ]

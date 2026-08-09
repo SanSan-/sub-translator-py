@@ -21,7 +21,7 @@ def without_non_end_symbols(key: str) -> bool:
 __all__ = [
     "only_end_symbols",
     "without_dashes",
-    "without_word_count",
-    "without_word_and_dashes",
     "without_non_end_symbols",
+    "without_word_and_dashes",
+    "without_word_count",
 ]

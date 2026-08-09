@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 RESOURCES_DIR = BASE_DIR / "resources"
@@ -51,57 +50,49 @@ SMART_SPLIT_MAX_CHARS = 220
 SMART_SPLIT_MAX_GAP_MS = 800
 SMART_SPLIT_MAX_DURATION_MS = 6000
 SMART_SPLIT_COMMA_WINDOW = 3
-
-
-def correct_sort(values: Iterable[int]) -> List[int]:
-    """Сортирует индексы так же, как в оригинале."""
-    return sorted(values)
-
-
 __all__ = [
-    "BASE_DIR",
-    "RESOURCES_DIR",
-    "CACHE_DIR",
-    "PERSIST_DIR",
-    "LOGS_DIR",
-    "MODELS_DIR",
-    "TRANSLATOR_LOGS_DIR",
-    "USAGE_STATS_FILE",
-    "SUBTITLE_CACHE_FILE",
-    "NEW_LINE_SIGN",
-    "HARD_NEW_LINE_SIGN",
-    "BIG_NEW_LINE_SIGN",
-    "EQUAL_SIGN",
-    "PLUS_SIGN",
-    "MINUS_SIGN",
-    "UNDERGROUND_SIGN",
-    "SLASH_SIGN",
-    "DOT_SIGN",
-    "COMMA_SIGN",
-    "SEMICOLON_SIGN",
     "AMPERSAND_SIGN",
     "ASTERISK_SIGN",
-    "QUESTION_SIGN",
-    "RIGHT_COMA_SIGN",
-    "LEFT_COMA_SIGN",
-    "SPACE_SIGN",
-    "FIRST_GROUP",
-    "SECOND_GROUP",
-    "EMPTY_STRING",
-    "QUOTE_JOINER",
-    "SEMICOLON_JOINER",
-    "ZERO_SIGN",
-    "ZERO_INT_SIGN",
-    "WEBVTT",
-    "NOT_VTT_ERROR",
+    "BASE_DIR",
+    "BIG_NEW_LINE_SIGN",
+    "CACHE_DIR",
+    "COMMA_SIGN",
     "DEFAULT_BATCH_SIZE",
-    "DEFAULT_THREAD_COUNT",
     "DEFAULT_MAX_LEN",
+    "DEFAULT_THREAD_COUNT",
+    "DOT_SIGN",
+    "EMPTY_STRING",
+    "EQUAL_SIGN",
+    "FIRST_GROUP",
+    "HARD_NEW_LINE_SIGN",
+    "LEFT_COMA_SIGN",
+    "LOGS_DIR",
+    "MINUS_SIGN",
+    "MODELS_DIR",
+    "NEW_LINE_SIGN",
+    "NOT_VTT_ERROR",
+    "PERSIST_DIR",
+    "PLUS_SIGN",
+    "QUESTION_SIGN",
+    "QUOTE_JOINER",
+    "RESOURCES_DIR",
+    "RIGHT_COMA_SIGN",
+    "SECOND_GROUP",
+    "SEMICOLON_JOINER",
+    "SEMICOLON_SIGN",
+    "SLASH_SIGN",
+    "SMART_SPLIT_COMMA_WINDOW",
+    "SMART_SPLIT_MAX_CHARS",
+    "SMART_SPLIT_MAX_DURATION_MS",
+    "SMART_SPLIT_MAX_GAP_MS",
     "SMART_SPLIT_MAX_LINES",
     "SMART_SPLIT_MAX_WORDS",
-    "SMART_SPLIT_MAX_CHARS",
-    "SMART_SPLIT_MAX_GAP_MS",
-    "SMART_SPLIT_MAX_DURATION_MS",
-    "SMART_SPLIT_COMMA_WINDOW",
-    "correct_sort",
+    "SPACE_SIGN",
+    "SUBTITLE_CACHE_FILE",
+    "TRANSLATOR_LOGS_DIR",
+    "UNDERGROUND_SIGN",
+    "USAGE_STATS_FILE",
+    "WEBVTT",
+    "ZERO_INT_SIGN",
+    "ZERO_SIGN",
 ]

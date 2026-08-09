@@ -1,50 +1,37 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from sub_translate.constants import (
     BIG_NEW_LINE_SIGN,
     EMPTY_STRING,
     FIRST_GROUP,
-    SPACE_SIGN,
-    WEBVTT,
     NOT_VTT_ERROR,
-    ZERO_INT_SIGN,
+    SMART_SPLIT_COMMA_WINDOW,
     SMART_SPLIT_MAX_CHARS,
     SMART_SPLIT_MAX_DURATION_MS,
     SMART_SPLIT_MAX_GAP_MS,
     SMART_SPLIT_MAX_LINES,
     SMART_SPLIT_MAX_WORDS,
-    SMART_SPLIT_COMMA_WINDOW,
-    correct_sort,
+    SPACE_SIGN,
+    WEBVTT,
 )
 from sub_translate.dictionaries.bad_symbols import BAD_SYMBOLS
 from sub_translate.dictionaries.filters import (
-    only_end_symbols,
     without_dashes,
-    without_non_end_symbols,
     without_word_and_dashes,
     without_word_count,
 )
 from sub_translate.dictionaries.regex import (
     ASS_COMMENTS_MASK,
     ASS_EFFECTS_MASK,
-    BRACKET_MASK,
-    COLON_MASK,
-    COMMA_MASK,
-    DASH_MASK,
-    DOT_MASK,
     DOUBLE_SPACES_MASK,
     DRAW_MASK,
-    EXCLAMATION_MARK_MASK,
     GOOD_END_SYMBOLS_MASK,
-    ITALIAN_MASK,
     NEXT_LINE_MASK,
     NO_SPACE_NEXT_LINE_MASK,
-    QUESTION_MARK_MASK,
-    QUOTE_MASK,
-    SEMICOLON_MASK,
     SRT_EFFECTS_MASK,
 )
 from sub_translate.enums import FileFormat
@@ -63,18 +50,16 @@ from sub_translate.utils.common_utils import is_empty, is_empty_array
 from sub_translate.utils.validation_utils import (
     ass_separator,
     ass_validator,
-    count_regexp_entry,
     srt_start_validator,
     srt_time_extract,
     srt_time_validator,
+    vtt_header_validator,
+    vtt_time_extract,
+    vtt_time_validator,
 )
 
-_SENTENCE_SPACE_DOT_MASK = re.compile(
-    r"([.])(?=(?:[\"')\]]?)[A-Z\u0410-\u042F\u0401])"
-)
-_SENTENCE_SPACE_QE_MASK = re.compile(
-    r"([!?])(?=(?:[\"')\]]?)[A-Z\u0410-\u042F\u0401])"
-)
+_SENTENCE_SPACE_DOT_MASK = re.compile(r"([.])(?=[\"')\]]?[A-Z\u0410-\u042F\u0401])")
+_SENTENCE_SPACE_QE_MASK = re.compile(r"([!?])(?=[\"')\]]?[A-Z\u0410-\u042F\u0401])")
 _SENTENCE_SKIP_CHARS = {'"', "'", ")", "]"}
 _SENTENCE_START_SKIP_CHARS = {'"', "'", "(", ")", "[", "]", "{", "}", "«", "»", "-", "—", "–"}
 _COMMA_CHARS = {",", "，"}
@@ -96,9 +81,7 @@ def _should_insert_qe_space(text: str, pos: int) -> bool:
         return False
     next_char = text[next_idx]
     if prev_char.isascii() and prev_char.isalpha() and next_char.isascii() and next_char.isalpha():
-        if _is_inside_parentheses(text, pos):
-            return False
-        return True
+        return not _is_inside_parentheses(text, pos)
     return True
 
 
@@ -141,7 +124,7 @@ def _word_has_comma(word: str) -> bool:
     return any(char in word for char in _COMMA_CHARS)
 
 
-def _adjust_split_by_comma(words: List[str], start_idx: int, count: int, max_count: int) -> int:
+def _adjust_split_by_comma(words: list[str], start_idx: int, count: int, max_count: int) -> int:
     if SMART_SPLIT_COMMA_WINDOW <= 0 or count <= 0 or max_count <= 0:
         return count
     preferred = start_idx + count - 1
@@ -161,37 +144,46 @@ def _adjust_split_by_comma(words: List[str], start_idx: int, count: int, max_cou
     return count
 
 
-def _split_words_by_weights(words: List[str], weights: List[int]) -> List[int]:
+def _calculate_weighted_count(
+    words: list[str],
+    weights: list[int],
+    suffix_weights: list[int],
+    offset: int,
+    idx: int,
+) -> int:
+    remaining_words = len(words) - offset
+    remaining_lines = len(weights) - idx
+    if remaining_lines == 1:
+        return remaining_words
+    max_count = remaining_words - (remaining_lines - 1)
+    if max_count <= 0:
+        return 0
+    remaining_weight = suffix_weights[idx]
+    raw = (
+        round(remaining_words * weights[idx] / remaining_weight)
+        if remaining_weight > 0
+        else max(1, remaining_words // remaining_lines)
+    )
+    count = min(max(raw, 1), max_count)
+    return _adjust_split_by_comma(words, offset, count, max_count)
+
+
+def _split_words_by_weights(words: list[str], weights: list[int]) -> list[int]:
     if not weights:
         return []
     total_words = len(words)
     if total_words == 0:
         return [0] * len(weights)
-    suffix_weights: List[int] = []
+    suffix_weights: list[int] = []
     running = 0
     for weight in reversed(weights):
         running += max(0, int(weight))
         suffix_weights.append(running)
     suffix_weights.reverse()
-    counts: List[int] = []
+    counts: list[int] = []
     offset = 0
-    for idx, weight in enumerate(weights):
-        remaining_words = total_words - offset
-        remaining_lines = len(weights) - idx
-        if remaining_lines == 1:
-            count = remaining_words
-        else:
-            remaining_weight = suffix_weights[idx]
-            if remaining_weight > 0:
-                raw = int(round(remaining_words * weight / remaining_weight))
-            else:
-                raw = max(1, remaining_words // remaining_lines)
-            max_count = remaining_words - (remaining_lines - 1)
-            if max_count <= 0:
-                count = 0
-            else:
-                count = min(max(raw, 1), max_count)
-                count = _adjust_split_by_comma(words, offset, count, max_count)
+    for idx in range(len(weights)):
+        count = _calculate_weighted_count(words, weights, suffix_weights, offset, idx)
         counts.append(count)
         offset += count
     if offset < total_words and counts:
@@ -221,7 +213,7 @@ def replace_all(text: str, pattern, replacement: str) -> str:
     return temp
 
 
-def format_line(line: str, dictionary: List[Dict[str, str]]) -> str:
+def format_line(line: str, dictionary: list[dict[str, str]]) -> str:
     temp = str(line)
     for item in dictionary:
         temp = replace_all_words(temp, item["key"], item["val"])
@@ -240,75 +232,130 @@ def clean_line(text: str) -> str:
     return temp.strip()
 
 
-def parse_ass_dialogs(origins: List[str]) -> Dict[int, AssSubtitlesItem]:
-    dialogs: Dict[int, AssSubtitlesItem] = {}
+def parse_ass_events(origins: list[str]) -> dict[int, AssSubtitlesItem]:
+    events: dict[int, AssSubtitlesItem] = {}
     for idx, text in enumerate(origins):
         if ass_validator(text):
-            dialogs.update(ass_separator(idx, text))
-    return dialogs
+            events.update(ass_separator(idx, text))
+    return events
 
 
-def parse_srt_dialogs(origins: List[str]) -> Dict[int, SrtSubtitlesItem]:
+def parse_ass_dialogs(origins: list[str]) -> dict[int, AssSubtitlesItem]:
+    return {key: event for key, event in parse_ass_events(origins).items() if event.translatable}
+
+
+def _read_dialog_body(
+    origins: list[str],
+    start: int,
+    is_end: Callable[[str], bool],
+    time_validator: Callable[[str], bool] = srt_time_validator,
+    time_extract: Callable[[str], list[str]] = srt_time_extract,
+) -> tuple[int, list[str], list[str]]:
+    text_lines: list[str] = []
+    times: list[str] = []
+    index = start
+    while index < len(origins) and not is_end(origins[index]):
+        line = origins[index]
+        if time_validator(line):
+            times = time_extract(line)
+        elif not is_empty(line):
+            text_lines.append(line)
+        index += 1
+    return index, text_lines, times
+
+
+def _is_srt_cue_start(origins: list[str], index: int) -> bool:
+    return index + 1 < len(origins) and srt_start_validator(origins[index]) and srt_time_validator(origins[index + 1])
+
+
+def _select_srt_dialog_key(
+    cue_id: str,
+    dialogs: dict[int, SrtSubtitlesItem],
+    duplicate_key: int,
+) -> tuple[int, int]:
+    line_index = int(cue_id)
+    if line_index not in dialogs:
+        return line_index, duplicate_key
+    while duplicate_key in dialogs:
+        duplicate_key -= 1
+    return duplicate_key, duplicate_key - 1
+
+
+def _read_srt_text(origins: list[str], start: int) -> tuple[int, list[str]]:
+    text_lines: list[str] = []
+    index = start
+    while index < len(origins) and not _is_srt_cue_start(origins, index):
+        if not is_empty(origins[index]):
+            text_lines.append(origins[index])
+        index += 1
+    return index, text_lines
+
+
+def parse_srt_dialogs(origins: list[str]) -> dict[int, SrtSubtitlesItem]:
+    dialogs: dict[int, SrtSubtitlesItem] = {}
+    duplicate_key = -1
     i = 0
-    while i < len(origins) and not srt_start_validator(origins[i]):
-        i += 1
-    dialogs: Dict[int, SrtSubtitlesItem] = {}
     while i < len(origins):
-        line_index = int(origins[i]) if srt_start_validator(origins[i]) else 0
-        temp: List[str] = []
-        times: List[str] = []
-        i += 1
-        while i < len(origins) and not srt_start_validator(origins[i]):
-            if srt_time_validator(origins[i]):
-                times = srt_time_extract(origins[i])
-            elif not is_empty(origins[i]):
-                temp.append(origins[i])
+        if not _is_srt_cue_start(origins, i):
             i += 1
-        dialogs[line_index] = SrtSubtitlesItem(
-            start_time=times[0] if times else None,
-            end_time=times[1] if len(times) > 1 else None,
-            text=(SPACE_SIGN + BIG_NEW_LINE_SIGN).join(temp),
-        )
+            continue
+        cue_id = origins[i]
+        line_index, duplicate_key = _select_srt_dialog_key(cue_id, dialogs, duplicate_key)
+        times = srt_time_extract(origins[i + 1])
+        i, text_lines = _read_srt_text(origins, i + 2)
+        if text_lines:
+            dialogs[line_index] = SrtSubtitlesItem(
+                start_time=times[0],
+                end_time=times[1],
+                text=BIG_NEW_LINE_SIGN.join(text_lines),
+                cue_id=cue_id,
+            )
     return dialogs
 
 
-def parse_vtt_dialogs(origins: List[str]) -> Dict[int, SrtSubtitlesItem]:
-    if not origins or origins[0] != WEBVTT:
+def _read_vtt_dialog(origins: list[str], start: int) -> tuple[int, SrtSubtitlesItem | None]:
+    cue_id: str | None = None
+    index = start
+    if not vtt_time_validator(origins[index]):
+        candidate = origins[index].strip()
+        cue_id = candidate if candidate else None
+        index += 1
+    index, text_lines, times = _read_dialog_body(
+        origins,
+        index,
+        lambda line: clean_line(line) == EMPTY_STRING,
+        vtt_time_validator,
+        vtt_time_extract,
+    )
+    if len(times) != 2 or is_empty_array(text_lines):
+        return index, None
+    return index, SrtSubtitlesItem(
+        start_time=times[0],
+        end_time=times[1],
+        text=BIG_NEW_LINE_SIGN.join(text_lines),
+        cue_id=cue_id,
+    )
+
+
+def parse_vtt_dialogs(origins: list[str]) -> dict[int, SrtSubtitlesItem]:
+    if not origins or not vtt_header_validator(origins[0]):
         raise ValueError(NOT_VTT_ERROR)
     i = 1
-    dialogs: Dict[int, SrtSubtitlesItem] = {}
+    dialogs: dict[int, SrtSubtitlesItem] = {}
     while i < len(origins):
         if clean_line(origins[i]) == EMPTY_STRING:
             i += 1
             continue
-        line_index = len(dialogs) + 1
-        temp: List[str] = []
-        times: List[str] = []
-        cue_id: str | None = None
-        if not srt_time_validator(origins[i]):
-            candidate = origins[i].strip()
-            cue_id = candidate if candidate else None
-            i += 1
-        while i < len(origins) and clean_line(origins[i]) != EMPTY_STRING:
-            if srt_time_validator(origins[i]):
-                times = srt_time_extract(origins[i])
-            elif not is_empty(origins[i]):
-                temp.append(origins[i])
-            i += 1
-        if not is_empty_array(temp):
-            dialogs[line_index] = SrtSubtitlesItem(
-                start_time=times[0] if times else None,
-                end_time=times[1] if len(times) > 1 else None,
-                text=(SPACE_SIGN + BIG_NEW_LINE_SIGN).join(temp),
-                cue_id=cue_id,
-            )
+        i, dialog = _read_vtt_dialog(origins, i)
+        if dialog is not None:
+            dialogs[len(dialogs) + 1] = dialog
     return dialogs
 
 
 def _parse_timecode_ms(value: str | None) -> int | None:
     if not value:
         return None
-    raw = value.strip()
+    raw = value.strip().split(maxsplit=1)[0]
     if not raw:
         return None
     raw = raw.replace(",", ".")
@@ -339,114 +386,164 @@ def _parse_timecode_ms(value: str | None) -> int | None:
     return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
 
 
+@dataclass(frozen=True, slots=True)
+class _SmartSplitLimits:
+    max_lines: int
+    max_words: int
+    max_chars: int
+    max_gap_ms: int
+    max_duration_ms: int
+
+
+@dataclass(slots=True)
+class _PrepareBuffer:
+    lines: list[int] = field(default_factory=list)
+    text: str = EMPTY_STRING
+    word_count: int = 0
+    char_count: int = 0
+    start_ms: int | None = None
+    end_ms: int | None = None
+
+    def add(self, key: int, dialog: SrtSubtitlesItem) -> int | None:
+        dialog_text = dialog.text or EMPTY_STRING
+        self.lines.append(key)
+        self.text += f" {dialog_text}"
+        cleaned = clean_line(dialog_text)
+        if cleaned:
+            self.word_count += len([word for word in cleaned.split(SPACE_SIGN) if word])
+            self.char_count += len(cleaned)
+        if self.start_ms is None:
+            self.start_ms = _parse_timecode_ms(dialog.start_time)
+        current_end_ms = _parse_timecode_ms(dialog.end_time)
+        if current_end_ms is not None:
+            self.end_ms = current_end_ms
+        return current_end_ms
+
+    def flush(self, result: list[PrepareToTranslateItem]) -> None:
+        to_translate = clean_line(self.text)
+        if not is_empty(to_translate):
+            result.append(
+                PrepareToTranslateItem(
+                    idx=len(result),
+                    lines=self.lines,
+                    to_translate=to_translate,
+                )
+            )
+        self.lines = []
+        self.text = EMPTY_STRING
+        self.word_count = 0
+        self.char_count = 0
+        self.start_ms = None
+        self.end_ms = None
+
+
+def _normalize_setting(value: int | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        numeric = int(value)
+    except TypeError, ValueError:
+        return default
+    return numeric if numeric > 0 else default
+
+
+def _smart_split_limits(settings: SmartSplitSettings | None) -> _SmartSplitLimits:
+    return _SmartSplitLimits(
+        max_lines=_normalize_setting(settings.max_lines if settings else None, SMART_SPLIT_MAX_LINES),
+        max_words=_normalize_setting(settings.max_words if settings else None, SMART_SPLIT_MAX_WORDS),
+        max_chars=_normalize_setting(settings.max_chars if settings else None, SMART_SPLIT_MAX_CHARS),
+        max_gap_ms=_normalize_setting(settings.max_gap_ms if settings else None, SMART_SPLIT_MAX_GAP_MS),
+        max_duration_ms=_normalize_setting(
+            settings.max_duration_ms if settings else None,
+            SMART_SPLIT_MAX_DURATION_MS,
+        ),
+    )
+
+
+def _should_start_new_group(
+    current_text: str,
+    previous_text: str | None,
+    use_smart_dialog_splitter: bool,
+    buffer: _PrepareBuffer,
+) -> bool:
+    if not use_smart_dialog_splitter or not buffer.lines or not _starts_with_upper(current_text):
+        return False
+    if previous_text and GOOD_END_SYMBOLS_MASK.search(previous_text):
+        return False
+    return not previous_text or _starts_with_lower(previous_text)
+
+
+def _duration_limit_reached(buffer: _PrepareBuffer, limits: _SmartSplitLimits) -> bool:
+    if buffer.start_ms is None or buffer.end_ms is None:
+        return False
+    return buffer.end_ms - buffer.start_ms >= limits.max_duration_ms
+
+
+def _gap_limit_reached(
+    current_end_ms: int | None,
+    next_dialog: SrtSubtitlesItem | None,
+    limits: _SmartSplitLimits,
+) -> bool:
+    if current_end_ms is None or next_dialog is None:
+        return False
+    next_start_ms = _parse_timecode_ms(next_dialog.start_time)
+    return next_start_ms is not None and next_start_ms - current_end_ms >= limits.max_gap_ms
+
+
+def _should_flush_group(
+    dialog_text: str,
+    current_end_ms: int | None,
+    next_dialog: SrtSubtitlesItem | None,
+    use_smart_dialog_splitter: bool,
+    is_last: bool,
+    buffer: _PrepareBuffer,
+    limits: _SmartSplitLimits,
+) -> bool:
+    if is_last or not use_smart_dialog_splitter:
+        return True
+    if GOOD_END_SYMBOLS_MASK.search(dialog_text):
+        return True
+    size_limit_reached = (
+        len(buffer.lines) >= limits.max_lines
+        or buffer.word_count >= limits.max_words
+        or buffer.char_count >= limits.max_chars
+    )
+    return (
+        size_limit_reached
+        or _duration_limit_reached(buffer, limits)
+        or _gap_limit_reached(current_end_ms, next_dialog, limits)
+    )
+
+
 def build_prepare(
-    dialogs: Dict[int, SrtSubtitlesItem],
+    dialogs: dict[int, SrtSubtitlesItem],
     use_smart_dialog_splitter: bool = False,
     smart_split_settings: SmartSplitSettings | None = None,
-) -> List[PrepareToTranslateItem]:
-    def _normalize_setting(value: int | None, default: int) -> int:
-        if value is None:
-            return default
-        try:
-            numeric = int(value)
-        except (TypeError, ValueError):
-            return default
-        return numeric if numeric > 0 else default
-
-    max_lines = _normalize_setting(
-        smart_split_settings.max_lines if smart_split_settings else None, SMART_SPLIT_MAX_LINES
-    )
-    max_words = _normalize_setting(
-        smart_split_settings.max_words if smart_split_settings else None, SMART_SPLIT_MAX_WORDS
-    )
-    max_chars = _normalize_setting(
-        smart_split_settings.max_chars if smart_split_settings else None, SMART_SPLIT_MAX_CHARS
-    )
-    max_gap_ms = _normalize_setting(
-        smart_split_settings.max_gap_ms if smart_split_settings else None, SMART_SPLIT_MAX_GAP_MS
-    )
-    max_duration_ms = _normalize_setting(
-        smart_split_settings.max_duration_ms if smart_split_settings else None, SMART_SPLIT_MAX_DURATION_MS
-    )
-
-    result: List[PrepareToTranslateItem] = []
-    tempo_lines: List[int] = []
-    tempo_text = EMPTY_STRING
-    tempo_word_count = 0
-    tempo_char_count = 0
-    tempo_start_ms: int | None = None
-    tempo_end_ms: int | None = None
-    prev_text: str | None = None
-
-    def _flush_tempo() -> None:
-        nonlocal tempo_lines, tempo_text, tempo_word_count, tempo_char_count, tempo_start_ms, tempo_end_ms
-        to_translate = clean_line(tempo_text)
-        if not is_empty(to_translate):
-            result.append(PrepareToTranslateItem(idx=len(result), lines=tempo_lines, to_translate=to_translate))
-        tempo_lines = []
-        tempo_text = EMPTY_STRING
-        tempo_word_count = 0
-        tempo_char_count = 0
-        tempo_start_ms = None
-        tempo_end_ms = None
-
-    def _should_split_before(current_text: str, previous_text: str | None) -> bool:
-        if not use_smart_dialog_splitter or not tempo_lines:
-            return False
-        if not _starts_with_upper(current_text):
-            return False
-        if previous_text and GOOD_END_SYMBOLS_MASK.search(previous_text):
-            return False
-        if previous_text and not _starts_with_lower(previous_text):
-            return False
-        return True
-    keys = correct_sort([int(key) for key in dialogs.keys()])
+) -> list[PrepareToTranslateItem]:
+    result: list[PrepareToTranslateItem] = []
+    buffer = _PrepareBuffer()
+    limits = _smart_split_limits(smart_split_settings)
+    previous_text: str | None = None
+    keys = list(dialogs)
     for idx, key in enumerate(keys):
         dialog = dialogs[key]
         dialog_text = dialog.text or EMPTY_STRING
-        if _should_split_before(dialog_text, prev_text):
-            _flush_tempo()
-        tempo_lines.append(key)
-        tempo_text += f" {dialog_text}"
-        cleaned = clean_line(dialog_text)
-        if cleaned:
-            tempo_word_count += len([word for word in cleaned.split(SPACE_SIGN) if word])
-            tempo_char_count += len(cleaned)
-        if tempo_start_ms is None:
-            tempo_start_ms = _parse_timecode_ms(dialog.start_time)
-        end_time_ms = _parse_timecode_ms(dialog.end_time)
-        if end_time_ms is not None:
-            tempo_end_ms = end_time_ms
-        should_split = False
-        if not use_smart_dialog_splitter:
-            should_split = True
-        else:
-            if GOOD_END_SYMBOLS_MASK.search(dialog_text):
-                should_split = True
-            elif len(tempo_lines) >= max_lines:
-                should_split = True
-            elif tempo_word_count >= max_words:
-                should_split = True
-            elif tempo_char_count >= max_chars:
-                should_split = True
-            else:
-                if tempo_start_ms is not None and tempo_end_ms is not None:
-                    duration = tempo_end_ms - tempo_start_ms
-                    if duration >= max_duration_ms:
-                        should_split = True
-                if not should_split and idx < len(keys) - 1:
-                    next_dialog = dialogs.get(keys[idx + 1])
-                    if next_dialog is not None:
-                        next_start = _parse_timecode_ms(next_dialog.start_time)
-                        if (
-                            end_time_ms is not None
-                            and next_start is not None
-                            and next_start - end_time_ms >= max_gap_ms
-                        ):
-                            should_split = True
-        if should_split or idx == len(keys) - 1:
-            _flush_tempo()
-        prev_text = dialog_text
+        if _should_start_new_group(dialog_text, previous_text, use_smart_dialog_splitter, buffer):
+            buffer.flush(result)
+        current_end_ms = buffer.add(key, dialog)
+        is_last = idx == len(keys) - 1
+        next_dialog = None if is_last else dialogs.get(keys[idx + 1])
+        if _should_flush_group(
+            dialog_text,
+            current_end_ms,
+            next_dialog,
+            use_smart_dialog_splitter,
+            is_last,
+            buffer,
+            limits,
+        ):
+            buffer.flush(result)
+        previous_text = dialog_text
     return result
 
 
@@ -455,19 +552,37 @@ def _calc_effect_index(line: str, match: str) -> int:
     return 0 if is_empty(before) else len(before.split(SPACE_SIGN))
 
 
-def build_effects(line: str) -> Dict[int, str]:
-    result: Dict[int, str] = {}
+def build_effects(line: str) -> dict[int, str]:
+    result: dict[int, str] = {}
     matches = ASS_EFFECTS_MASK.findall(line)
     for match in matches:
-        result[_calc_effect_index(line, match)] = match
+        effect_index = _calc_effect_index(line, match)
+        result[effect_index] = f"{result.get(effect_index, EMPTY_STRING)}{match}"
     srt_matches = SRT_EFFECTS_MASK.findall(line)
     for match in srt_matches:
-        result[_calc_effect_index(line, match)] = match
+        effect_index = _calc_effect_index(line, match)
+        result[effect_index] = f"{result.get(effect_index, EMPTY_STRING)}{match}"
     return result
 
 
-def _count_symbols(text: str) -> AnalysedLine:
-    counts = {
+_SYMBOL_COUNT_KEYS = {
+    ".": "dotCount",
+    ",": "commaCount",
+    '"': "quoteCount",
+    "<": "quoteCount",
+    ">": "quoteCount",
+    "(": "bracketCount",
+    ")": "bracketCount",
+    "-": "dashCount",
+    ":": "colonCount",
+    ";": "semicolonCount",
+    "?": "questionMarkCount",
+    "!": "exclamationMarkCount",
+}
+
+
+def _empty_symbol_counts() -> AnalysedLine:
+    return {
         "dotCount": 0,
         "commaCount": 0,
         "quoteCount": 0,
@@ -478,35 +593,16 @@ def _count_symbols(text: str) -> AnalysedLine:
         "questionMarkCount": 0,
         "exclamationMarkCount": 0,
     }
+
+
+def _count_symbols(text: str) -> AnalysedLine:
+    counts = _empty_symbol_counts()
     for char in text:
-        if char == ".":
-            counts["dotCount"] += 1
-            continue
         if char == ":":
             counts["dotCount"] += 1
-            counts["colonCount"] += 1
-            continue
-        if char == ",":
-            counts["commaCount"] += 1
-            continue
-        if char == ";":
-            counts["semicolonCount"] += 1
-            continue
-        if char == "?":
-            counts["questionMarkCount"] += 1
-            continue
-        if char == "!":
-            counts["exclamationMarkCount"] += 1
-            continue
-        if char == "-":
-            counts["dashCount"] += 1
-            continue
-        if char in {"(", ")"}:
-            counts["bracketCount"] += 1
-            continue
-        if char in {'"', "<", ">"}:
-            counts["quoteCount"] += 1
-            continue
+        count_key = _SYMBOL_COUNT_KEYS.get(char)
+        if count_key:
+            counts[count_key] += 1
     return counts
 
 
@@ -524,13 +620,12 @@ def analyse_line(dialog_line: str) -> AnalysedDialog:
         "exclamationMarkCount": 0,
     }
     lines = NEXT_LINE_MASK.split(dialog_line)
-    analysed: List[AnalysedLine] = []
+    analysed: list[AnalysedLine] = []
     if DRAW_MASK.search(dialog_line):
         analysed.append({**result, "effects": {0: dialog_line}})
     else:
         for line in lines:
-            raw_line = ITALIAN_MASK.sub(EMPTY_STRING, line)
-            raw_line = DRAW_MASK.sub(EMPTY_STRING, raw_line)
+            raw_line = DRAW_MASK.sub(EMPTY_STRING, line)
             pure_line = clean_line(line)
             counted = _count_symbols(pure_line)
             analysed.append(
@@ -558,7 +653,7 @@ def analyse_line(dialog_line: str) -> AnalysedDialog:
     return result
 
 
-def analyse_lines(dialogs: Dict[int, AssSubtitlesItem]) -> AnalysedItem:
+def analyse_lines(dialogs: dict[int, AssSubtitlesItem]) -> AnalysedItem:
     result: AnalysedItem = {}
     for key, dialog in dialogs.items():
         analysed = analyse_line(dialog.text or EMPTY_STRING)
@@ -572,7 +667,7 @@ def analyse_lines(dialogs: Dict[int, AssSubtitlesItem]) -> AnalysedItem:
     return result
 
 
-def _add_effects(words: List[str], effects: Dict[int, str]) -> None:
+def _add_effects(words: list[str], effects: dict[int, str]) -> None:
     for key in sorted(effects.keys()):
         if key < len(words):
             words[key] = effects[key] + words[key]
@@ -580,14 +675,11 @@ def _add_effects(words: List[str], effects: Dict[int, str]) -> None:
             words[-1] = words[-1] + effects[key]
 
 
-def _any_less(from_obj: Dict[str, int], diff: Dict[str, int], filter_func=lambda key: True) -> bool:
-    for key in filter(filter_func, from_obj.keys()):
-        if from_obj.get(key, 0) < diff.get(key, 0):
-            return True
-    return False
+def _any_less(from_obj: dict[str, int], diff: dict[str, int], filter_func=lambda key: True) -> bool:
+    return any(from_obj.get(key, 0) < diff.get(key, 0) for key in filter(filter_func, from_obj))
 
 
-def _all_zeros(obj: Dict[str, int], filter_func=lambda key: True) -> bool:
+def _all_zeros(obj: dict[str, int], filter_func=lambda key: True) -> bool:
     total = 0
     for key in filter(filter_func, obj.keys()):
         value = obj.get(key)
@@ -595,79 +687,102 @@ def _all_zeros(obj: Dict[str, int], filter_func=lambda key: True) -> bool:
             continue
         try:
             total += int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return total == 0
 
 
+def _take_characters_for_line(
+    characters: list[str],
+    current_line: AnalysedLine,
+    chars_per_line: int,
+) -> tuple[str, list[str]]:
+    if not characters:
+        head = [EMPTY_STRING]
+        _add_effects(head, current_line.get("effects", {}))
+        return EMPTY_STRING.join(head), characters
+    head = [characters[0]]
+    count = 1
+    while count < len(characters):
+        symbol_counts = _count_symbols(EMPTY_STRING.join(head))
+        needs_symbols = _any_less(symbol_counts, current_line)
+        needs_length = _all_zeros(current_line, without_word_count) and count < chars_per_line
+        if not needs_symbols and not needs_length:
+            break
+        head.append(characters[count])
+        count += 1
+    _add_effects(head, current_line.get("effects", {}))
+    return EMPTY_STRING.join(head), characters[count:]
+
+
 def _split_chars_by_line(
-    words: List[str],
+    words: list[str],
     lines_per_word: int,
-    lines: List[AnalysedLine],
-    result: List[str],
+    lines: list[AnalysedLine],
+    result: list[str],
 ) -> None:
     for idx, word in enumerate(words):
         characters = list(word)
         chars_per_lines = int((len(characters) + lines_per_word - 1) / lines_per_word)
-        temp: List[str] = []
+        temp: list[str] = []
         for j in range(idx * lines_per_word, idx * lines_per_word + lines_per_word):
             cur = lines[j]
-            if cur.get("wordCount", 0) > 0:
-                if not characters:
-                    head = [EMPTY_STRING]
-                    _add_effects(head, cur.get("effects", {}))
-                    temp.append(EMPTY_STRING.join(head))
-                    continue
-                head = [characters[0]]
-                n = 1
-                while (
-                    _any_less(_count_symbols(EMPTY_STRING.join(head)), cur)
-                    or (_all_zeros(cur, without_word_count) and n < chars_per_lines)
-                ) and n < len(characters):
-                    head.append(characters[n])
-                    n += 1
-                _add_effects(head, cur.get("effects", {}))
-                temp.append(EMPTY_STRING.join(head))
-                characters = characters[n:]
-            else:
+            if cur.get("wordCount", 0) <= 0:
                 temp.append(BIG_NEW_LINE_SIGN)
+                continue
+            restored, characters = _take_characters_for_line(characters, cur, chars_per_lines)
+            temp.append(restored)
         result.append(BIG_NEW_LINE_SIGN.join(temp))
+
+
+def _needs_more_words(head: list[str], current_line: AnalysedLine, count: int) -> bool:
+    symbol_counts = _count_symbols(SPACE_SIGN.join(head))
+    needs_symbols = _any_less(symbol_counts, current_line, without_dashes)
+    needs_word_count = _all_zeros(current_line, without_word_count) and count < current_line.get("wordCount", 0)
+    needs_symbols_without_words = _all_zeros(
+        current_line,
+        without_word_and_dashes,
+    ) and _any_less(symbol_counts, current_line)
+    return needs_symbols or needs_word_count or needs_symbols_without_words
+
+
+def _take_words_for_line(
+    words: list[str],
+    current_line: AnalysedLine,
+) -> tuple[str, list[str]]:
+    head = [words[0]]
+    count = 1
+    while count < len(words) and current_line.get("wordCount", 0) > 1 and _needs_more_words(head, current_line, count):
+        head.append(words[count])
+        count += 1
+    _add_effects(head, current_line.get("effects", {}))
+    return SPACE_SIGN.join(head), words[count:]
+
+
+def _restore_empty_line(current_line: AnalysedLine) -> str:
+    if current_line.get("wordCount", 0) <= 0:
+        return EMPTY_STRING
+    head = [EMPTY_STRING]
+    _add_effects(head, current_line.get("effects", {}))
+    return SPACE_SIGN.join(head)
 
 
 def _split_words_by_line(
     lines_count: int,
-    lines: List[AnalysedLine],
-    words: List[str],
-    result: List[str],
+    lines: list[AnalysedLine],
+    words: list[str],
+    result: list[str],
 ) -> None:
     temp = list(words)
     last_text_idx: int | None = None
     for i in range(lines_count):
         cur = lines[i]
         if not temp:
-            if cur.get("wordCount", 0) > 0:
-                head = [EMPTY_STRING]
-                _add_effects(head, cur.get("effects", {}))
-                result.append(SPACE_SIGN.join(head))
-            else:
-                result.append(EMPTY_STRING)
+            result.append(_restore_empty_line(cur))
             continue
         if cur.get("wordCount", 0) > 0:
-            head = [temp[0]]
-            j = 1
-            while (
-                _any_less(_count_symbols(SPACE_SIGN.join(head)), cur, without_dashes)
-                or (_all_zeros(cur, without_word_count) and j < cur.get("wordCount", 0))
-                or (
-                    _all_zeros(cur, without_word_and_dashes)
-                    and _any_less(_count_symbols(SPACE_SIGN.join(head)), cur)
-                )
-            ) and cur.get("wordCount", 0) > 1 and j < len(temp):
-                head.append(temp[j])
-                j += 1
-            _add_effects(head, cur.get("effects", {}))
-            result.append(SPACE_SIGN.join(head))
-            temp = temp[j:]
+            restored, temp = _take_words_for_line(temp, cur)
+            result.append(restored)
             last_text_idx = i
         else:
             result.append(EMPTY_STRING)
@@ -681,7 +796,7 @@ def _split_words_by_line(
 
 
 def _restore_line(text: str, analysis: AnalysedDialog) -> str:
-    result: List[str] = []
+    result: list[str] = []
     words = text.split(SPACE_SIGN)
     lines = analysis.get("lines", [])
     lines_count = len(lines)
@@ -698,99 +813,206 @@ def _restore_line(text: str, analysis: AnalysedDialog) -> str:
     return BIG_NEW_LINE_SIGN.join(result)
 
 
+def _line_metadata(
+    line_idxs: list[int],
+    analysis: AnalysedItem,
+) -> list[tuple[int, AnalysedDialog, int]]:
+    result: list[tuple[int, AnalysedDialog, int]] = []
+    for line_idx in line_idxs:
+        current = analysis.get(line_idx)
+        if current:
+            result.append((line_idx, current, int(current.get("wordCount", 0) or 0)))
+    return result
+
+
+def _restore_weighted_lines(
+    result: TranslatedDialogItem,
+    words: list[str],
+    lines_with_words: list[tuple[int, AnalysedDialog, int]],
+) -> None:
+    counts = _split_words_by_weights(words, [metadata[2] for metadata in lines_with_words])
+    offset = 0
+    for (line_idx, current, _), count in zip(lines_with_words, counts, strict=True):
+        segment = words[offset : offset + count] if count > 0 else []
+        offset += count
+        result[line_idx] = _restore_line(SPACE_SIGN.join(segment), current)
+
+
+def _restore_multiple_dialogs(
+    result: TranslatedDialogItem,
+    text: str,
+    line_idxs: list[int],
+    analysis: AnalysedItem,
+) -> None:
+    metadata = _line_metadata(line_idxs, analysis)
+    words = [word for word in text.split(SPACE_SIGN) if word]
+    lines_with_words = [line for line in metadata if line[2] > 0]
+    if words and lines_with_words:
+        _restore_weighted_lines(result, words, lines_with_words)
+    for line_idx, current, word_count in metadata:
+        if word_count <= 0 and line_idx not in result:
+            result[line_idx] = _restore_line(EMPTY_STRING, current)
+
+
+def _restore_translated_item(
+    result: TranslatedDialogItem,
+    item: TranslatedItem,
+    analysis: AnalysedItem,
+) -> None:
+    if not item.lines:
+        return
+    text = clean_line(item.text)
+    if len(item.lines) > 1:
+        _restore_multiple_dialogs(result, text, item.lines, analysis)
+        return
+    line_idx = item.lines[0]
+    current = analysis.get(line_idx)
+    if current:
+        result[line_idx] = _restore_line(text, current)
+
+
 def build_translated_dialogs(
-    translated: List[TranslatedItem],
+    translated: list[TranslatedItem],
     analysis: AnalysedItem,
 ) -> TranslatedDialogItem:
     result: TranslatedDialogItem = {}
     for item in translated:
-        line_idxs = item.lines
-        lines_count = len(line_idxs)
-        text = clean_line(item.text)
-        if lines_count > 1:
-            words = [word for word in text.split(SPACE_SIGN) if word]
-            line_meta: List[tuple[int, AnalysedDialog, int]] = []
-            for line_idx in line_idxs:
-                cur = analysis.get(line_idx)
-                if not cur:
-                    continue
-                word_count = int(cur.get("wordCount", 0) or 0)
-                line_meta.append((line_idx, cur, word_count))
-            lines_with_words = [meta for meta in line_meta if meta[2] > 0]
-            if words and lines_with_words:
-                weights = [meta[2] for meta in lines_with_words]
-                counts = _split_words_by_weights(words, weights)
-                offset = 0
-                for (line_idx, cur, _), count in zip(lines_with_words, counts):
-                    segment = words[offset : offset + count] if count > 0 else []
-                    offset += count
-                    result[line_idx] = _restore_line(SPACE_SIGN.join(segment), cur)
-            for line_idx, cur, word_count in line_meta:
-                if word_count <= 0 and line_idx not in result:
-                    result[line_idx] = _restore_line(EMPTY_STRING, cur)
-        else:
-            if not line_idxs:
-                continue
-            cur = analysis.get(line_idxs[0])
-            if not cur:
-                continue
-            result[line_idxs[0]] = _restore_line(text, cur)
+        _restore_translated_item(result, item, analysis)
     return result
 
 
-def _build_ass_dialog_line(dialog: AssSubtitlesItem, text: str) -> str:
-    return (
-        f"Dialogue: {dialog.layer if dialog.layer is not None else ZERO_INT_SIGN},"
-        f"{dialog.start_time or EMPTY_STRING},{dialog.end_time or EMPTY_STRING},"
-        f"{dialog.style or EMPTY_STRING},{dialog.actor or EMPTY_STRING},"
-        f"{dialog.margin_l if dialog.margin_l is not None else ZERO_INT_SIGN},"
-        f"{dialog.margin_r if dialog.margin_r is not None else ZERO_INT_SIGN},"
-        f"{dialog.margin_v if dialog.margin_v is not None else ZERO_INT_SIGN},"
-        f"{dialog.effect or EMPTY_STRING},{text or EMPTY_STRING}"
-    )
+def _replace_ass_dialog_text(line: str, text: str) -> str:
+    fields = line.split(",", 9)
+    if len(fields) != 10:
+        return line
+    return ",".join([*fields[:9], text or EMPTY_STRING])
+
+
+def _build_ass_export_lines(
+    origin: list[str],
+    dialogs: dict[int, AssSubtitlesItem],
+    translated_dialogs: TranslatedDialogItem,
+) -> list[str]:
+    return [
+        _replace_ass_dialog_text(line, translated_dialogs[idx])
+        if idx in dialogs and idx in translated_dialogs
+        else line
+        for idx, line in enumerate(origin)
+    ]
+
+
+def _append_timed_dialog(
+    result: list[str],
+    key: int,
+    dialog: AssSubtitlesItem | None,
+    translated_text: str,
+    file_format: str,
+) -> None:
+    if file_format == FileFormat.VTT.value and dialog and dialog.cue_id:
+        result.append(dialog.cue_id)
+    if file_format == FileFormat.SRT.value:
+        result.append(dialog.cue_id if dialog and dialog.cue_id is not None else str(key))
+    result.append(f"{dialog.start_time if dialog else EMPTY_STRING} --> {dialog.end_time if dialog else EMPTY_STRING}")
+    result.extend(translated_text.split(BIG_NEW_LINE_SIGN))
+    result.append(EMPTY_STRING)
+
+
+def _build_vtt_preamble(origin: list[str]) -> list[str]:
+    if not origin or not vtt_header_validator(origin[0]):
+        return [WEBVTT, EMPTY_STRING]
+    result = [origin[0]]
+    for line in origin[1:]:
+        if line == EMPTY_STRING:
+            break
+        result.append(line)
+    result.append(EMPTY_STRING)
+    return result
+
+
+def _vtt_timing_index(block: list[str]) -> int | None:
+    if block and vtt_time_validator(block[0]):
+        return 0
+    if len(block) > 1 and vtt_time_validator(block[1]):
+        return 1
+    return None
+
+
+def _build_vtt_export_from_origin(
+    origin: list[str],
+    dialogs: dict[int, AssSubtitlesItem],
+    translated_dialogs: TranslatedDialogItem,
+) -> list[str]:
+    result: list[str] = []
+    dialog_keys = iter(dialogs)
+    next_key = next(dialog_keys, None)
+    index = 0
+    while index < len(origin):
+        if origin[index] == EMPTY_STRING:
+            result.append(EMPTY_STRING)
+            index += 1
+            continue
+        block_end = index
+        while block_end < len(origin) and origin[block_end] != EMPTY_STRING:
+            block_end += 1
+        block = origin[index:block_end]
+        timing_index = _vtt_timing_index(block)
+        if timing_index is None or next_key is None:
+            result.extend(block)
+        else:
+            current_key = next_key
+            next_key = next(dialog_keys, None)
+            if current_key not in translated_dialogs:
+                result.extend(block)
+            else:
+                result.extend(block[: timing_index + 1])
+                result.extend(translated_dialogs[current_key].split(BIG_NEW_LINE_SIGN))
+        index = block_end
+    return result
+
+
+def _build_timed_export_lines(
+    origin: list[str],
+    file_format: str,
+    dialogs: dict[int, AssSubtitlesItem],
+    translated_dialogs: TranslatedDialogItem,
+) -> list[str]:
+    result = _build_vtt_preamble(origin) if file_format == FileFormat.VTT.value else []
+    for key, dialog in dialogs.items():
+        if key not in translated_dialogs:
+            continue
+        _append_timed_dialog(
+            result,
+            key,
+            dialog,
+            translated_dialogs[key],
+            file_format,
+        )
+    return result
 
 
 def build_export_lines(
-    origin: List[str],
+    origin: list[str],
     file_format: str,
-    dialogs: Dict[int, AssSubtitlesItem],
+    dialogs: dict[int, AssSubtitlesItem],
     translated_dialogs: TranslatedDialogItem,
-) -> List[str]:
-    result: List[str] = []
+) -> list[str]:
     if file_format == FileFormat.ASS.value:
-        for idx, line in enumerate(origin):
-            if idx in translated_dialogs:
-                result.append(_build_ass_dialog_line(dialogs[idx], translated_dialogs[idx]))
-            else:
-                result.append(line)
-    else:
-        if file_format == FileFormat.VTT.value:
-            result.append(WEBVTT)
-            result.append(EMPTY_STRING)
-        for key in correct_sort([int(k) for k in translated_dialogs.keys()]):
-            dialog = dialogs.get(key)
-            if file_format == FileFormat.VTT.value and dialog and dialog.cue_id:
-                result.append(dialog.cue_id)
-            if file_format == FileFormat.SRT.value:
-                result.append(str(key))
-            result.append(
-                f"{dialog.start_time if dialog else EMPTY_STRING} --> {dialog.end_time if dialog else EMPTY_STRING}"
-            )
-            for text in translated_dialogs[key].split(BIG_NEW_LINE_SIGN):
-                result.append(text)
-            result.append(EMPTY_STRING)
-    return result
+        return _build_ass_export_lines(origin, dialogs, translated_dialogs)
+    if file_format == FileFormat.VTT.value and origin and vtt_header_validator(origin[0]):
+        return _build_vtt_export_from_origin(origin, dialogs, translated_dialogs)
+    return _build_timed_export_lines(origin, file_format, dialogs, translated_dialogs)
 
 
 __all__ = [
-    "format_line",
-    "clean_line",
-    "parse_ass_dialogs",
-    "parse_srt_dialogs",
-    "parse_vtt_dialogs",
-    "build_prepare",
     "analyse_line",
     "analyse_lines",
-    "build_translated_dialogs",
     "build_export_lines",
+    "build_prepare",
+    "build_translated_dialogs",
+    "clean_line",
+    "format_line",
+    "parse_ass_dialogs",
+    "parse_ass_events",
+    "parse_srt_dialogs",
+    "parse_vtt_dialogs",
 ]

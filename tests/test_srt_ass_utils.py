@@ -35,10 +35,7 @@ def test_build_export_lines_srt_order() -> None:
 
 def test_build_export_lines_ass_keeps_dialogue_line() -> None:
     origins = _load_fixture("akebi11.ass.json")
-    target_line = (
-        "Dialogue: 0,0:00:06.47,0:00:09.73,main,Riri,0000,0000,0000,,"
-        "Oh, they have that store in Tokyo, too?"
-    )
+    target_line = "Dialogue: 0,0:00:06.47,0:00:09.73,main,Riri,0000,0000,0000,,Oh, they have that store in Tokyo, too?"
     target_index = origins.index(target_line)
     dialogs = parse_ass_dialogs(origins)
     translated = {target_index: dialogs[target_index].text or ""}
@@ -49,6 +46,6 @@ def test_build_export_lines_ass_keeps_dialogue_line() -> None:
     assert parts[2] == "0:00:09.73"
     assert parts[3] == "main"
     assert parts[4] == "Riri"
-    assert parts[5:8] == ["0", "0", "0"]
+    assert parts[5:8] == ["0000", "0000", "0000"]
     assert parts[8] == ""
     assert parts[9] == "Oh, they have that store in Tokyo, too?"

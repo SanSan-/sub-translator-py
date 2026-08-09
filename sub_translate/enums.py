@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-from enum import Enum
+from enum import Enum, StrEnum
 
 
-class FileFormat(str, Enum):
+class FileFormat(StrEnum):
     ASS = "ass"
     SRT = "srt"
     VTT = "vtt"
 
-
-class TranslatorApiType(str, Enum):
-    GOOGLE = "google"
-    AGENT = "agent"
-    YANDEX = "yandex"
+    __str__ = Enum.__str__
+    __format__ = Enum.__format__
 
 
-__all__ = ["FileFormat", "TranslatorApiType"]
+__all__ = ["FileFormat"]

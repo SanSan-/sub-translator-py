@@ -3,18 +3,61 @@
 from __future__ import annotations
 
 import re
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
-SOURCE_WRAPPER_PATTERN = re.compile(r"^\s*<SOURCE>\s*(.*?)\s*</SOURCE>\s*$", re.DOTALL)
+_SOURCE_OPEN_TAG = "<SOURCE>"
+_SOURCE_CLOSE_TAG = "</SOURCE>"
+_SINGLE_EMPHASIS_PATTERN = re.compile(r"(?<!\*)\*(?!\*)([^*\n]++)\*(?!\*)")
+
+
+def _strip_trailing_line_spaces(text: str) -> str:
+    return "\n".join(line.rstrip(" \t") for line in text.split("\n"))
+
+
+def _decimal_run_end(text: str, start: int) -> int:
+    end = start
+    while end < len(text) and text[end].isdecimal():
+        end += 1
+    return end
+
+
+def _read_exponent_fragment(text: str, start: int) -> tuple[str, int]:
+    first_end = _decimal_run_end(text, start)
+    if first_end >= len(text) or text[first_end] != "^":
+        return text[start:first_end], first_end
+
+    second_start = first_end + 1
+    second_end = _decimal_run_end(text, second_start)
+    if second_end == second_start:
+        return text[start:second_start], second_start
+
+    next_index = second_end
+    if second_end < len(text) and text[second_end] == "^":
+        next_index += 1
+    return text[start:second_end], next_index
+
+
+def _normalize_exponent_markers(text: str) -> str:
+    """Удаляет второй маркер из записи вида ``2^3^`` за линейное время."""
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index].isdecimal():
+            fragment, index = _read_exponent_fragment(text, index)
+            result.append(fragment)
+        else:
+            result.append(text[index])
+            index += 1
+    return "".join(result)
 
 
 def strip_source_wrapper(text: str) -> str:
     """Удаляет обёртку <SOURCE>...</SOURCE>, если она присутствует."""
     if not isinstance(text, str):
         return ""
-    match = SOURCE_WRAPPER_PATTERN.match(text)
-    if match:
-        return match.group(1).strip("\r\n")
+    stripped = text.strip()
+    if stripped.startswith(_SOURCE_OPEN_TAG) and stripped.endswith(_SOURCE_CLOSE_TAG):
+        return stripped[len(_SOURCE_OPEN_TAG) : -len(_SOURCE_CLOSE_TAG)].strip()
     return text
 
 
@@ -23,17 +66,49 @@ def postprocess_translation(text: str) -> str:
     if not text:
         return text
     text = strip_source_wrapper(text)
-    text = re.sub(
-        r"(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)",
+    text = _SINGLE_EMPHASIS_PATTERN.sub(
         lambda match: f" *{match.group(1).strip()}* ",
         text,
     )
-    text = re.sub(r"(\d+)\^(\d+)\^", r"\1^\2", text)
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    return text
+    text = _normalize_exponent_markers(text)
+    return _strip_trailing_line_spaces(text)
 
 
-def split_long_text(text: str, token_limit: int, token_counter: Callable[[str], int]) -> List[str]:
+def _split_sentence_by_words(
+    sentence: str,
+    token_limit: int,
+    token_counter: Callable[[str], int],
+) -> list[str]:
+    result: list[str] = []
+    piece: list[str] = []
+    for word in sentence.split():
+        tentative = " ".join([*piece, word])
+        if piece and token_counter(tentative) > token_limit:
+            result.append(" ".join(piece))
+            piece = [word]
+        else:
+            piece.append(word)
+    if piece:
+        result.append(" ".join(piece))
+    return result
+
+
+def _start_next_sentence(
+    result: list[str],
+    current: str,
+    sentence: str,
+    token_limit: int,
+    token_counter: Callable[[str], int],
+) -> str:
+    if current:
+        result.append(current)
+    if token_counter(sentence) <= token_limit:
+        return sentence
+    result.extend(_split_sentence_by_words(sentence, token_limit, token_counter))
+    return ""
+
+
+def split_long_text(text: str, token_limit: int, token_counter: Callable[[str], int]) -> list[str]:
     """
     Дробит текст на части, чтобы каждая укладывалась в `token_limit`.
 
@@ -42,43 +117,25 @@ def split_long_text(text: str, token_limit: int, token_counter: Callable[[str], 
     if token_counter(text) <= token_limit:
         return [text]
 
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    result: List[str] = []
+    sentences = filter(None, re.split(r"(?<=[.!?])\s+", text))
+    result: list[str] = []
     current = ""
 
     for sentence in sentences:
-        if not sentence:
-            continue
         tentative = f"{current} {sentence}".strip() if current else sentence
         if token_counter(tentative) <= token_limit:
             current = tentative
-            continue
-
-        if current:
-            result.append(current)
-        current = ""
-
-        if token_counter(sentence) <= token_limit:
-            current = sentence
-            continue
-
-        words = sentence.split()
-        piece: List[str] = []
-        for word in words:
-            tentative_piece = " ".join(piece + [word])
-            if token_counter(tentative_piece) > token_limit and piece:
-                result.append(" ".join(piece))
-                piece = [word]
-            else:
-                piece.append(word)
-        if piece:
-            result.append(" ".join(piece))
+        else:
+            current = _start_next_sentence(
+                result,
+                current,
+                sentence,
+                token_limit,
+                token_counter,
+            )
 
     if current:
-        if token_counter(current) > token_limit:
-            result.extend(split_long_text(current, token_limit, token_counter))
-        else:
-            result.append(current)
+        result.append(current)
 
     return result
 
@@ -89,7 +146,7 @@ def translate_text(
     token_limit: int,
     token_counter: Callable[[str], int],
     chunk_translator: Callable[[str], str],
-    postprocess: Optional[Callable[[str], str]] = postprocess_translation,
+    postprocess: Callable[[str], str] | None = postprocess_translation,
 ) -> str:
     """
     Переводит текст построчно, дробя длинные строки на части.
@@ -101,7 +158,7 @@ def translate_text(
     :param postprocess: функция постобработки результата (по умолчанию `postprocess_translation`).
     """
     lines = text.split("\n")
-    translated_lines: List[str] = []
+    translated_lines: list[str] = []
 
     for line in lines:
         stripped = line.strip()

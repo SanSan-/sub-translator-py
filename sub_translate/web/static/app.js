@@ -18,10 +18,9 @@ const threadsInput = settingsForm.querySelector("[data-setting=\"threads\"]");
 const googleSections = settingsForm.querySelectorAll("[data-section=\"google\"]");
 const agentSections = settingsForm.querySelectorAll("[data-section=\"agent\"]");
 const localSections = settingsForm.querySelectorAll("[data-section=\"local\"]");
+const localWorkerSections = settingsForm.querySelectorAll("[data-section=\"local-worker\"]");
+const localModelMeta = document.getElementById("localModelMeta");
 const agentModelInput = settingsForm.querySelector("[data-setting=\"agent_model\"]");
-const openAiKeyBtn = document.getElementById("editOpenAiKey");
-const openAiKeyModal = document.getElementById("openAiKeyModal");
-const openAiKeyArea = document.getElementById("openAiKeyArea");
 const systemPromptBtn = document.getElementById("editSystemPrompt");
 const userPromptBtn = document.getElementById("editUserPrompt");
 const systemPromptModal = document.getElementById("systemPromptModal");
@@ -41,8 +40,22 @@ const smartSplitInputs = smartSplitModal
   : [];
 
 const SETTINGS_STORAGE_KEY = "subTranslateSettings";
+const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
+const volatileSettingKeys = new Set([
+  "agent_system_prompt",
+  "agent_prompt",
+  "agent_system_prompt_file",
+  "agent_prompt_file",
+]);
+const allowedSettingKeys = new Set(
+  Array.from(settingsForm.querySelectorAll("[data-setting]"))
+    .map((input) => input.dataset.setting)
+    .filter((key) => key && !volatileSettingKeys.has(key))
+);
 const allowCpuFallbackInput = settingsForm.querySelector("[data-setting=\"allow_cpu_fallback\"]");
+const autoDownloadModelInput = settingsForm.querySelector("[data-setting=\"auto_download_model\"]");
 const forceCacheInput = settingsForm.querySelector("[data-setting=\"force\"]");
+const timeoutInput = settingsForm.querySelector("[data-setting=\"timeout\"]");
 
 const statusLabels = {
   idle: "ожидание",
@@ -53,7 +66,6 @@ const statusLabels = {
 };
 
 const finalStates = new Set(["cached", "done", "error"]);
-const localApis = new Set(["nllb", "nllb-lite", "seamless", "madlad", "fsm"]);
 const googleApis = new Set(["google"]);
 const agentApis = new Set(["agent"]);
 
@@ -67,6 +79,7 @@ const state = {
   completed: new Set(),
   uiConfig: null,
   lastThreadValue: null,
+  agentConfigured: false,
 };
 
 function appendLog(message) {
@@ -138,6 +151,30 @@ function setSelectOptions(select, options, fallbackValue) {
   select.defaultValue = nextValue;
 }
 
+function getTranslatorProfile(api) {
+  const translators = state.uiConfig?.translators;
+  if (!Array.isArray(translators)) {
+    return null;
+  }
+  return translators.find((profile) => profile.id === api) || null;
+}
+
+function setTargetLanguageOptions(profile, languageConfig, fallbackValue) {
+  let options = languageConfig?.target || [];
+  const directions = Array.isArray(profile?.supported_directions)
+    ? profile.supported_directions
+    : [];
+  if (directions.length > 0 && sourceLangSelect) {
+    const allowedTargets = new Set(
+      directions
+        .filter((direction) => direction.source === sourceLangSelect.value)
+        .map((direction) => direction.target)
+    );
+    options = options.filter((item) => allowedTargets.has(item.value));
+  }
+  setSelectOptions(targetLangSelect, options, fallbackValue);
+}
+
 function loadStoredSettings() {
   if (!window.localStorage) {
     return null;
@@ -151,8 +188,15 @@ function loadStoredSettings() {
     if (!parsed || typeof parsed !== "object") {
       return null;
     }
-    return parsed;
-  } catch (err) {
+    const sanitized = Object.fromEntries(
+      Object.entries(parsed).filter(([key]) => allowedSettingKeys.has(key))
+    );
+    if (Object.keys(sanitized).length !== Object.keys(parsed).length) {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(sanitized));
+    }
+    return sanitized;
+  } catch {
+    console.warn("Сохранённые настройки повреждены и будут проигнорированы.");
     return null;
   }
 }
@@ -162,10 +206,12 @@ function persistSettings() {
     return;
   }
   try {
-    const settings = readSettings();
+    const settings = Object.fromEntries(
+      Object.entries(readSettings()).filter(([key]) => allowedSettingKeys.has(key))
+    );
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch (err) {
-    // ignore storage errors
+  } catch {
+    console.warn("Браузер не разрешил сохранить настройки.");
   }
 }
 
@@ -173,8 +219,8 @@ function setSelectValueIfExists(select, value) {
   if (!select || value === undefined || value === null) {
     return;
   }
-  const option = Array.from(select.options).find((item) => item.value === value);
-  if (option) {
+  const hasOption = Array.from(select.options).some((item) => item.value === value);
+  if (hasOption) {
     select.value = value;
     select.defaultValue = value;
   }
@@ -185,16 +231,17 @@ function applyStoredSettings(stored) {
     return;
   }
   if (apiSelect && stored.api) {
-    apiSelect.value = stored.api;
+    setSelectValueIfExists(apiSelect, stored.api);
   }
   updateApiDependentUi();
   const api = apiSelect ? apiSelect.value : "google";
+  const profile = getTranslatorProfile(api);
   settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
     const key = input.dataset.setting;
     if (key === "api" || key === "source_lang" || key === "target_lang") {
       return;
     }
-    if (!Object.prototype.hasOwnProperty.call(stored, key)) {
+    if (!Object.hasOwn(stored, key)) {
       return;
     }
     const value = stored[key];
@@ -208,7 +255,7 @@ function applyStoredSettings(stored) {
       if (Number.isFinite(parsed)) {
         if (key === "threads") {
           state.lastThreadValue = String(parsed);
-          if (localApis.has(api)) {
+          if (profile && !profile.thread_safe) {
             return;
           }
         }
@@ -219,27 +266,30 @@ function applyStoredSettings(stored) {
     setInputDefaults(input, value == null ? "" : value);
   });
   setSelectValueIfExists(sourceLangSelect, stored.source_lang);
+  const languageConfig = state.uiConfig?.languages?.[api];
+  setTargetLanguageOptions(profile, languageConfig, stored.target_lang || "ru");
   setSelectValueIfExists(targetLangSelect, stored.target_lang);
   updatePromptStatus();
   updateSmartSplitUi();
 }
 
 function updatePromptStatus() {
-  if (!systemPromptStatus || !userPromptStatus || !openAiKeyStatus) {
+  if (!systemPromptStatus || !userPromptStatus) {
     return;
   }
   const systemText = systemPromptArea ? systemPromptArea.value.trim() : "";
   const userText = userPromptArea ? userPromptArea.value.trim() : "";
-  const apiKeyText = openAiKeyArea ? openAiKeyArea.value.trim() : "";
   systemPromptStatus.textContent = systemText
     ? `Системный промпт: ${systemText.length} символов.`
     : "Системный промпт не задан.";
   userPromptStatus.textContent = userText
     ? `Промпт агента: ${userText.length} символов.`
     : "Промпт агента не задан.";
-  openAiKeyStatus.textContent = apiKeyText
-    ? `OpenAI ключ: ${apiKeyText.length} символов.`
-    : "Ключ не задан.";
+  if (openAiKeyStatus) {
+    openAiKeyStatus.textContent = state.agentConfigured
+      ? "Ключ задан в окружении сервера."
+      : "Ключ не задан в окружении сервера.";
+  }
 }
 
 function readNumericValue(input) {
@@ -310,12 +360,12 @@ function closeSmartSplitModal(restore) {
     try {
       const snapshot = JSON.parse(smartSplitModal.dataset.prevValue || "{}");
       smartSplitInputs.forEach((input) => {
-        if (Object.prototype.hasOwnProperty.call(snapshot, input.dataset.setting)) {
+        if (Object.hasOwn(snapshot, input.dataset.setting)) {
           input.value = snapshot[input.dataset.setting];
         }
       });
-    } catch (err) {
-      // игнорируем поврежденный снимок
+    } catch {
+      console.warn("Снимок настроек объединения повреждён и будет проигнорирован.");
     }
   }
   smartSplitModal.hidden = true;
@@ -349,17 +399,18 @@ function closePromptModal(modal, area, restore) {
 
 function updateApiDependentUi() {
   const api = apiSelect ? apiSelect.value : "google";
+  const profile = getTranslatorProfile(api);
   const config = state.uiConfig || {};
   const langConfig = config.languages ? config.languages[api] : null;
   const defaults = config.defaults || {};
   if (langConfig) {
     setSelectOptions(sourceLangSelect, langConfig.source || [], defaults.source_lang || "en");
-    setSelectOptions(targetLangSelect, langConfig.target || [], defaults.target_lang || "ru");
+    setTargetLanguageOptions(profile, langConfig, defaults.target_lang || "ru");
   }
 
   if (threadsInput) {
-    const isLocal = localApis.has(api);
-    if (isLocal) {
+    const requiresSingleThread = Boolean(profile && !profile.thread_safe);
+    if (requiresSingleThread) {
       if (!threadsInput.disabled) {
         state.lastThreadValue = threadsInput.value || threadsInput.defaultValue;
       }
@@ -374,7 +425,36 @@ function updateApiDependentUi() {
 
   setSectionVisibility(googleSections, googleApis.has(api));
   setSectionVisibility(agentSections, agentApis.has(api));
-  setSectionVisibility(localSections, localApis.has(api));
+  setSectionVisibility(localSections, Boolean(profile?.local));
+  setSectionVisibility(localWorkerSections, profile?.runtime_kind === "isolated_worker");
+  const profileTimeout = profile?.default_timeout_seconds || defaults.timeout || 30;
+  setInputDefaults(timeoutInput, profileTimeout);
+  updateLocalModelMeta(profile);
+}
+
+function updateLocalModelMeta(profile) {
+  if (!localModelMeta || !profile?.local) {
+    return;
+  }
+  const model = profile.model || {};
+  const parts = [];
+  if (model.id) {
+    parts.push(`Модель: ${model.id}.`);
+  }
+  if (model.revision) {
+    parts.push(`Ревизия: ${model.revision}.`);
+  }
+  if (model.quantization) {
+    parts.push(`Квантование: ${model.quantization}.`);
+  }
+  if (model.requires_access_token) {
+    parts.push(
+      model.access_token_configured
+        ? "Токен Hugging Face задан на сервере."
+        : "Для загрузки нужен токен Hugging Face в окружении сервера."
+    );
+  }
+  localModelMeta.textContent = parts.join(" ") || "Для профиля не задана модель.";
 }
 
 async function loadUiConfig() {
@@ -385,6 +465,10 @@ async function loadUiConfig() {
   const config = await response.json();
   state.uiConfig = config;
   const defaults = config.defaults || {};
+  const translatorOptions = Array.isArray(config.translators)
+    ? config.translators.map((profile) => ({ value: profile.id, label: profile.label }))
+    : [];
+  setSelectOptions(apiSelect, translatorOptions, defaults.api || "google");
   setInputDefaults(batchSizeInput, defaults.batch_size || 21);
   setInputDefaults(threadsInput, defaults.threads || 3);
   setInputDefaults(settingsForm.querySelector("[data-setting=\"tld\"]"), defaults.tld || "com");
@@ -415,6 +499,11 @@ async function loadUiConfig() {
     allowCpuFallbackInput.checked = allowFallback;
     allowCpuFallbackInput.defaultChecked = allowFallback;
   }
+  if (autoDownloadModelInput) {
+    const autoDownload = Boolean(defaults.auto_download_model);
+    autoDownloadModelInput.checked = autoDownload;
+    autoDownloadModelInput.defaultChecked = autoDownload;
+  }
   if (forceCacheInput) {
     const forceEnabled = Boolean(defaults.force);
     forceCacheInput.checked = forceEnabled;
@@ -430,9 +519,7 @@ async function loadUiConfig() {
   if (agentModelInput) {
     setInputDefaults(agentModelInput, agentSettings.model || "");
   }
-  if (openAiKeyArea) {
-    setInputDefaults(openAiKeyArea, agentSettings.openai_api_key || "");
-  }
+  state.agentConfigured = Boolean(agentSettings.configured);
   updatePromptStatus();
   const stored = loadStoredSettings();
   if (stored) {
@@ -463,10 +550,6 @@ function readSettings() {
       data[key] = value === "" ? null : rawValue;
       return;
     }
-    if (key === "openai_api_key") {
-      data[key] = value === "" ? null : rawValue;
-      return;
-    }
     if (key === "agent_system_prompt_file" || key === "agent_prompt_file") {
       data[key] = value === "" ? null : value;
       return;
@@ -489,11 +572,11 @@ async function postJson(url, payload) {
     let detail = response.statusText;
     try {
       const data = await response.json();
-      if (data && data.detail) {
+      if (data?.detail) {
         detail = data.detail;
       }
-    } catch (err) {
-      // ignore
+    } catch {
+      detail = response.statusText || "Сервер вернул некорректный ответ.";
     }
     throw new Error(detail);
   }
@@ -635,7 +718,7 @@ async function runPick(kind) {
   try {
     await pick(kind);
   } catch (err) {
-    appendLog(`Ошибка выбора: ${err.message}`);
+    appendLog(`Ошибка выбора: ${err?.message || "неизвестная ошибка"}`);
   }
 }
 
@@ -661,7 +744,7 @@ async function loadActiveJob() {
     appendLog(`Ошибка синхронизации: ${err.message}`);
     return;
   }
-  if (!result || !result.active) {
+  if (!result?.active) {
     return;
   }
   const items = result.items || [];
@@ -713,13 +796,26 @@ async function translate() {
 }
 
 function listenJob(jobId) {
-  const stream = new EventSource(`/api/stream/${jobId}`);
+  if (!JOB_ID_PATTERN.test(jobId)) {
+    appendLog("Сервер вернул некорректный идентификатор задачи.\n");
+    state.jobId = null;
+    setTranslateBusy(false);
+    return;
+  }
+  const streamUrl = new URL(`/api/stream/${encodeURIComponent(jobId)}`, window.location.origin);
+  const stream = new EventSource(streamUrl);
 
   stream.onmessage = (event) => {
     if (!event.data) {
       return;
     }
-    const payload = JSON.parse(event.data);
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      appendLog("Получено повреждённое событие задачи.\n");
+      return;
+    }
     if (payload.type === "log") {
       appendLog(payload.message);
       return;
@@ -744,11 +840,13 @@ function listenJob(jobId) {
       return;
     }
     if (payload.type === "done") {
-      appendLog("Перевод завершен.\n");
+      const message = payload.status === "ok"
+        ? "Перевод завершён.\n"
+        : "Перевод завершён с ошибками.\n";
+      appendLog(message);
       stream.close();
       state.jobId = null;
       setTranslateBusy(false);
-      refreshCache();
     }
   };
 
@@ -759,21 +857,6 @@ function listenJob(jobId) {
     setTranslateBusy(false);
   };
 }
-
-picker.addEventListener("click", (event) => {
-  if (event.target instanceof Element && event.target.closest("button")) {
-    return;
-  }
-  event.preventDefault();
-  runPick("file");
-});
-
-picker.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" || event.key === " ") {
-    event.preventDefault();
-    runPick("file");
-  }
-});
 
 if (pickerFileBtn) {
   pickerFileBtn.addEventListener("click", (event) => {
@@ -821,6 +904,18 @@ if (apiSelect) {
   });
 }
 
+if (sourceLangSelect) {
+  sourceLangSelect.addEventListener("change", () => {
+    const api = apiSelect ? apiSelect.value : "google";
+    const profile = getTranslatorProfile(api);
+    const languageConfig = state.uiConfig?.languages?.[api];
+    const fallback = state.uiConfig?.defaults?.target_lang || "ru";
+    setTargetLanguageOptions(profile, languageConfig, fallback);
+    persistSettings();
+    refreshDebounced();
+  });
+}
+
 if (unloadBtn) {
   unloadBtn.addEventListener("click", async () => {
     if (state.jobId) return;
@@ -843,9 +938,6 @@ if (systemPromptBtn) {
 if (userPromptBtn) {
   userPromptBtn.addEventListener("click", () => openPromptModal(userPromptModal, userPromptArea));
 }
-if (openAiKeyBtn) {
-  openAiKeyBtn.addEventListener("click", () => openPromptModal(openAiKeyModal, openAiKeyArea));
-}
 if (smartSplitSettingsBtn) {
   smartSplitSettingsBtn.addEventListener("click", () => openSmartSplitModal());
 }
@@ -853,31 +945,33 @@ if (smartSplitInput) {
   smartSplitInput.addEventListener("change", () => updateSmartSplitUi());
 }
 
+function handlePromptModalAction(name, restore) {
+  const modal = name === "system" ? systemPromptModal : userPromptModal;
+  const area = name === "system" ? systemPromptArea : userPromptArea;
+  closePromptModal(modal, area, restore);
+}
+
+function handleModalAction(name, restore) {
+  if (name === "smart-split") {
+    closeSmartSplitModal(restore);
+    return;
+  }
+  if (name === "system" || name === "user") {
+    handlePromptModalAction(name, restore);
+  }
+}
+
 document.addEventListener("click", (event) => {
   const target = event.target;
-  if (target instanceof HTMLElement && target.dataset.modalClose === "system") {
-    closePromptModal(systemPromptModal, systemPromptArea, true);
+  if (!(target instanceof HTMLElement)) {
+    return;
   }
-  if (target instanceof HTMLElement && target.dataset.modalClose === "user") {
-    closePromptModal(userPromptModal, userPromptArea, true);
+  if (target.dataset.modalClose) {
+    handleModalAction(target.dataset.modalClose, true);
+    return;
   }
-  if (target instanceof HTMLElement && target.dataset.modalClose === "openai") {
-    closePromptModal(openAiKeyModal, openAiKeyArea, true);
-  }
-  if (target instanceof HTMLElement && target.dataset.modalClose === "smart-split") {
-    closeSmartSplitModal(true);
-  }
-  if (target instanceof HTMLElement && target.dataset.modalSave === "system") {
-    closePromptModal(systemPromptModal, systemPromptArea, false);
-  }
-  if (target instanceof HTMLElement && target.dataset.modalSave === "user") {
-    closePromptModal(userPromptModal, userPromptArea, false);
-  }
-  if (target instanceof HTMLElement && target.dataset.modalSave === "openai") {
-    closePromptModal(openAiKeyModal, openAiKeyArea, false);
-  }
-  if (target instanceof HTMLElement && target.dataset.modalSave === "smart-split") {
-    closeSmartSplitModal(false);
+  if (target.dataset.modalSave) {
+    handleModalAction(target.dataset.modalSave, false);
   }
 });
 
@@ -893,13 +987,6 @@ if (userPromptModal) {
   userPromptModal.addEventListener("click", (event) => {
     if (event.target === userPromptModal) {
       closePromptModal(userPromptModal, userPromptArea, true);
-    }
-  });
-}
-if (openAiKeyModal) {
-  openAiKeyModal.addEventListener("click", (event) => {
-    if (event.target === openAiKeyModal) {
-      closePromptModal(openAiKeyModal, openAiKeyArea, true);
     }
   });
 }
@@ -934,9 +1021,10 @@ settingsForm.addEventListener("input", (event) => {
 
 setTranslateBusy(false);
 
-loadUiConfig()
-  .then(() => loadActiveJob())
-  .catch((err) => {
-    appendLog(`Ошибка загрузки настроек UI: ${err.message}`);
-    updateApiDependentUi();
-  });
+try {
+  await loadUiConfig();
+  await loadActiveJob();
+} catch (err) {
+  appendLog(`Ошибка загрузки настроек UI: ${err.message}`);
+  updateApiDependentUi();
+}

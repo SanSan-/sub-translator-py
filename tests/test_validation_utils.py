@@ -41,7 +41,7 @@ def test_ass_separator_incorrect() -> None:
     idx = 155
     result = ass_separator(
         idx,
-        "Dialogue: ,0:00:36.72,0:00:37.97,Карасума_Годзё_23:28(Ep 10),Wakana,0,0,0,Ba750[;0;25],\"Ahh! The sergeants are\\\\Nabout to go at it again.\"\\\\N\"Oh!\" \"Yamada-{\\\\i1}san {\\\\i0}is timing\\\\Nwhen to present his head!\"",
+        'Dialogue: ,0:00:36.72,0:00:37.97,Карасума_Годзё_23:28(Ep 10),Wakana,0,0,0,Ba750[;0;25],"Ahh! The sergeants are\\\\Nabout to go at it again."\\\\N"Oh!" "Yamada-{\\\\i1}san {\\\\i0}is timing\\\\Nwhen to present his head!"',
     )
     assert is_empty_object(result)
 
@@ -237,13 +237,13 @@ def test_ass_separator_effects_scroll_up() -> None:
     idx = 25
     result = ass_separator(
         idx,
-        "Dialogue: 0,0:00:36.72,0:00:37.97,Italics - Top,Карасума_Годзё_23:28(Ep 10),0,0,0,Scroll up;125;350;99[;345],\"Ahh! The sergeants are\\Nabout to go at it again.\"\\N\"Oh!\" \"Yamada-{\\i1}san {\\i0}is timing\\Nwhen to present his head!\"",
+        'Dialogue: 0,0:00:36.72,0:00:37.97,Italics - Top,Карасума_Годзё_23:28(Ep 10),0,0,0,Scroll up;125;350;99[;345],"Ahh! The sergeants are\\Nabout to go at it again."\\N"Oh!" "Yamada-{\\i1}san {\\i0}is timing\\Nwhen to present his head!"',
     )
     assert not is_empty_object(result)
     assert result[idx].effect == "Scroll up;125;350;99[;345]"
     assert (
         result[idx].text
-        == "\"Ahh! The sergeants are\\Nabout to go at it again.\"\\N\"Oh!\" \"Yamada-{\\i1}san {\\i0}is timing\\Nwhen to present his head!\""
+        == '"Ahh! The sergeants are\\Nabout to go at it again."\\N"Oh!" "Yamada-{\\i1}san {\\i0}is timing\\Nwhen to present his head!"'
     )
 
 
@@ -255,10 +255,7 @@ def test_ass_separator_effects_banner() -> None:
     )
     assert not is_empty_object(result)
     assert result[idx].effect == "Banner;750[;0;125]"
-    assert (
-        result[idx].text
-        == "{\\q2\\blur1\\frz359.5\\pos(642,304)}Японский Словарь Вокала и Актёрского Мастерства"
-    )
+    assert result[idx].text == "{\\q2\\blur1\\frz359.5\\pos(642,304)}Японский Словарь Вокала и Актёрского Мастерства"
 
 
 def test_ass_separator_effects_none() -> None:

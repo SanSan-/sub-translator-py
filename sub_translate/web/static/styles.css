@@ -118,7 +118,7 @@ body::after {
   flex-direction: column;
   justify-content: center;
   gap: 4px;
-  cursor: pointer;
+  cursor: default;
   background: linear-gradient(130deg, rgba(31, 122, 140, 0.12), rgba(244, 162, 89, 0.16));
   position: relative;
   overflow: hidden;
@@ -244,6 +244,8 @@ body::after {
 
 .panel-logs {
   --delay: 0.15s;
+  min-height: 160px;
+  margin-top: auto;
 }
 
 .panel-header {
@@ -345,7 +347,7 @@ body::after {
   padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid rgba(154, 163, 173, 0.4);
-  color: #7a8088;
+  color: #343a40;
   background: rgba(154, 163, 173, 0.12);
   white-space: nowrap;
 }
@@ -423,7 +425,8 @@ body::after {
   font-size: 13px;
 }
 
-.field label {
+.field label,
+.field-label {
   font-weight: 600;
   color: var(--ink);
 }
@@ -453,6 +456,7 @@ body::after {
   gap: 4px;
   font-size: 12px;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .modal[hidden] {
@@ -500,7 +504,8 @@ body::after {
 }
 
 input,
-select {
+select,
+textarea {
   border-radius: 10px;
   border: 1px solid rgba(27, 31, 36, 0.2);
   padding: 8px 10px;
@@ -510,7 +515,8 @@ select {
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   outline: 2px solid rgba(31, 122, 140, 0.35);
   outline-offset: 1px;
 }
@@ -519,11 +525,6 @@ input[type="checkbox"] {
   width: 18px;
   height: 18px;
   accent-color: var(--accent);
-}
-
-.panel-logs {
-  min-height: 160px;
-  margin-top: auto;
 }
 
 .log-actions {

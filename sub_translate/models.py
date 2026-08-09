@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, TypedDict
+from pathlib import Path
+from typing import TypedDict
 
 from sub_translate.constants import (
     SMART_SPLIT_MAX_CHARS,
@@ -11,50 +12,56 @@ from sub_translate.constants import (
     SMART_SPLIT_MAX_WORDS,
 )
 
+
 @dataclass(slots=True)
 class SrtSubtitlesItem:
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
-    text: Optional[str] = None
-    cue_id: Optional[str] = None
+    start_time: str | None = None
+    end_time: str | None = None
+    text: str | None = None
+    cue_id: str | None = None
 
 
 @dataclass(slots=True)
 class AssSubtitlesItem(SrtSubtitlesItem):
-    layer: Optional[int] = None
-    style: Optional[str] = None
-    actor: Optional[str] = None
-    margin_l: Optional[int] = None
-    margin_r: Optional[int] = None
-    margin_v: Optional[int] = None
-    effect: Optional[str] = None
+    event_type: str = "Dialogue"
+    translatable: bool = True
+    layer: int | None = None
+    style: str | None = None
+    actor: str | None = None
+    margin_l: int | None = None
+    margin_r: int | None = None
+    margin_v: int | None = None
+    effect: str | None = None
 
 
 @dataclass(slots=True)
 class PrepareToTranslateItem:
     idx: int
     to_translate: str
-    lines: List[int]
+    lines: list[int]
 
 
 @dataclass(slots=True)
 class TranslatedItem:
     idx: int
     text: str
-    lines: List[int]
+    lines: list[int]
 
 
 @dataclass(slots=True)
 class TranslationOptions:
-    source_lang: Optional[str] = None
-    target_lang: Optional[str] = None
-    api: Optional[str] = None
-    tld: Optional[str] = None
-    request_delay_ms: Optional[int] = None
+    source_lang: str | None = None
+    target_lang: str | None = None
+    api: str | None = None
+    tld: str | None = None
+    request_delay_ms: int | None = None
     allow_cpu_fallback: bool = False
-    agent_model: Optional[str] = None
-    openai_api_key: Optional[str] = None
-    except_paths: Optional[List[str]] = None
+    model_path: Path | None = None
+    model_revision: str | None = None
+    worker_python_path: Path | None = None
+    auto_download_model: bool = False
+    agent_model: str | None = None
+    except_paths: list[str] | None = None
     detail: bool = False
 
 
@@ -78,26 +85,26 @@ class AnalysedLine(TypedDict, total=False):
     semicolonCount: int
     questionMarkCount: int
     exclamationMarkCount: int
-    effects: Dict[int, str]
+    effects: dict[int, str]
 
 
 class AnalysedDialog(AnalysedLine, total=False):
-    lines: List[AnalysedLine]
+    lines: list[AnalysedLine]
 
 
-AnalysedItem = Dict[int, AnalysedDialog]
-TranslatedDialogItem = Dict[int, str]
+AnalysedItem = dict[int, AnalysedDialog]
+TranslatedDialogItem = dict[int, str]
 
 
 __all__ = [
-    "SrtSubtitlesItem",
-    "AssSubtitlesItem",
-    "PrepareToTranslateItem",
-    "TranslatedItem",
-    "TranslationOptions",
-    "AnalysedLine",
     "AnalysedDialog",
     "AnalysedItem",
-    "TranslatedDialogItem",
+    "AnalysedLine",
+    "AssSubtitlesItem",
+    "PrepareToTranslateItem",
     "SmartSplitSettings",
+    "SrtSubtitlesItem",
+    "TranslatedDialogItem",
+    "TranslatedItem",
+    "TranslationOptions",
 ]

@@ -14,8 +14,8 @@
         <div class="brand-sub">Локальный и облачный перевод субтитров</div>
       </div>
       <div class="actions">
-        <div id="picker" class="picker" role="button" tabindex="0">
-          <div class="picker-icon">⬈</div>
+        <div id="picker" class="picker">
+          <div class="picker-icon" aria-hidden="true">⬈</div>
           <div class="picker-text">Выбор файла/папки</div>
           <div class="picker-hint">Нажмите, чтобы выбрать файл или папку</div>
           <div class="picker-actions">
@@ -23,8 +23,8 @@
             <button id="pickerFolderBtn" class="btn ghost" type="button">Папка</button>
           </div>
         </div>
-        <button id="unloadBtn" class="btn ghost" title="Выгрузить модели из памяти">🗑️ Выгрузить</button>
-        <button id="translateBtn" class="btn primary" disabled>Перевести</button>
+        <button id="unloadBtn" class="btn ghost" type="button" title="Выгрузить модели из памяти">🗑️ Выгрузить</button>
+        <button id="translateBtn" class="btn primary" type="button" disabled>Перевести</button>
       </div>
     </header>
 
@@ -45,61 +45,80 @@
         </div>
         <form id="settingsForm" class="settings-form">
           <div class="field">
-            <label>Переводчик</label>
-            <select data-setting="api">
-              <option value="google">google</option>
-              <option value="agent">agent</option>
-              <option value="nllb">nllb</option>
-              <option value="nllb-lite">nllb-lite</option>
-              <option value="seamless">seamless</option>
-              <option value="madlad">madlad</option>
-              <option value="fsm">fsm</option>
+            <label for="translatorApi">Переводчик</label>
+            <select id="translatorApi" data-setting="api">
+              <option value="google">Загрузка списка…</option>
             </select>
           </div>
           <div class="grid-2">
             <div class="field">
-              <label>Откуда</label>
+              <label for="sourceLang">Откуда</label>
               <select data-setting="source_lang" id="sourceLang"></select>
             </div>
             <div class="field">
-              <label>Куда</label>
+              <label for="targetLang">Куда</label>
               <select data-setting="target_lang" id="targetLang"></select>
             </div>
           </div>
           <div class="grid-2">
             <div class="field">
-              <label>Размер пачки</label>
-              <input data-setting="batch_size" type="number" min="1">
+              <label for="batchSize">Размер пачки</label>
+              <input id="batchSize" data-setting="batch_size" type="number" min="1">
             </div>
             <div class="field">
-              <label>Потоки</label>
-              <input data-setting="threads" type="number" min="1">
+              <label for="threadCount">Потоки</label>
+              <input id="threadCount" data-setting="threads" type="number" min="1">
             </div>
           </div>
           <div class="field toggle" data-section="local">
-            <label>Разрешить перевод на CPU при ошибке GPU</label>
-            <input data-setting="allow_cpu_fallback" type="checkbox">
+            <label for="allowCpuFallback">Разрешить перевод на CPU при ошибке GPU</label>
+            <input id="allowCpuFallback" data-setting="allow_cpu_fallback" type="checkbox">
           </div>
-          <div class="grid-2" data-section="google">
-            <div class="field">
-              <label>Домен</label>
-              <input data-setting="tld">
+          <div class="field" data-section="local">
+            <span class="field-label">Профиль локальной модели</span>
+            <div class="prompt-meta">
+              <span id="localModelMeta">Сведения о модели загружаются.</span>
+            </div>
+          </div>
+          <div class="field" data-section="local">
+            <label for="modelPath">Каталог модели</label>
+            <input id="modelPath" data-setting="model_path" type="text"
+                   placeholder="Пусто — каталог профиля">
+          </div>
+          <div class="field" data-section="local">
+            <label for="modelRevision">Ревизия модели</label>
+            <input id="modelRevision" data-setting="model_revision" type="text"
+                   placeholder="Пусто — закреплённая ревизия профиля">
+          </div>
+          <div class="field" data-section="local-worker">
+            <label for="workerPythonPath">Python изолированной среды</label>
+            <input id="workerPythonPath" data-setting="worker_python_path" type="text"
+                   placeholder="Пусто — основная среда приложения">
+          </div>
+          <div class="field toggle" data-section="local">
+            <label for="autoDownloadModel">Докачать неполную модель в выбранный каталог</label>
+            <input id="autoDownloadModel" data-setting="auto_download_model" type="checkbox">
+          </div>
+          <div class="grid-2">
+            <div class="field" data-section="google">
+              <label for="googleTld">Домен</label>
+              <input id="googleTld" data-setting="tld">
             </div>
             <div class="field">
-              <label>Таймаут, сек</label>
-              <input data-setting="timeout" type="number" min="1">
+              <label for="requestTimeout">Таймаут, сек</label>
+              <input id="requestTimeout" data-setting="timeout" type="number" min="1">
             </div>
           </div>
           <div class="field" data-section="google">
-            <label>Задержка между запросами, мс</label>
-            <input data-setting="request_delay_ms" type="number" min="0">
+            <label for="requestDelay">Задержка между запросами, мс</label>
+            <input id="requestDelay" data-setting="request_delay_ms" type="number" min="0">
           </div>
           <div class="field toggle">
-            <label>Умное объединение реплик</label>
-            <input data-setting="smart_split" type="checkbox">
+            <label for="smartSplit">Умное объединение реплик</label>
+            <input id="smartSplit" data-setting="smart_split" type="checkbox">
           </div>
           <div id="smartSplitControls" class="field" hidden>
-            <label>Настройки умного объединения</label>
+            <span class="field-label">Настройки умного объединения</span>
             <div class="prompt-actions">
               <button type="button" id="smartSplitSettingsBtn" class="btn ghost">Открыть</button>
             </div>
@@ -108,28 +127,25 @@
             </div>
           </div>
           <div class="field toggle">
-            <label>Игнорировать кеш перевода</label>
-            <input data-setting="force" type="checkbox">
+            <label for="forceTranslation">Игнорировать кеш перевода</label>
+            <input id="forceTranslation" data-setting="force" type="checkbox">
           </div>
           <div class="field toggle">
-            <label>Подробные логи</label>
-            <input data-setting="verbose" type="checkbox">
+            <label for="verboseLogs">Подробные логи</label>
+            <input id="verboseLogs" data-setting="verbose" type="checkbox">
           </div>
           <div class="field" data-section="agent">
-            <label>Версия модели</label>
-            <input data-setting="agent_model" type="text" placeholder="gpt-5.1-mini">
+            <label for="agentModel">Версия модели</label>
+            <input id="agentModel" data-setting="agent_model" type="text" placeholder="gpt-5.6-luna">
           </div>
           <div class="field" data-section="agent">
-            <label>OpenAI API ключ</label>
-            <div class="prompt-actions">
-              <button type="button" id="editOpenAiKey" class="btn ghost">Открыть ключ</button>
-            </div>
+            <span class="field-label">OpenAI API</span>
             <div class="prompt-meta">
-              <span id="openAiKeyStatus">Ключ не задан.</span>
+              <span id="openAiKeyStatus">Проверка настройки сервера.</span>
             </div>
           </div>
           <div class="field" data-section="agent">
-            <label>Промпты агента</label>
+            <span class="field-label">Промпты агента</span>
             <div class="prompt-actions">
               <button type="button" id="editSystemPrompt" class="btn ghost">Системный промпт</button>
               <button type="button" id="editUserPrompt" class="btn ghost">Промпт агента</button>
@@ -139,19 +155,9 @@
               <span id="userPromptStatus">Промпт агента не задан.</span>
             </div>
           </div>
-          <div id="openAiKeyModal" class="modal" hidden>
-            <div class="modal-card">
-              <div class="modal-title">OpenAI API ключ</div>
-              <textarea id="openAiKeyArea" class="prompt-area" data-setting="openai_api_key"></textarea>
-              <div class="modal-actions">
-                <button type="button" class="btn ghost" data-modal-close="openai">Отмена</button>
-                <button type="button" class="btn primary" data-modal-save="openai">Сохранить</button>
-              </div>
-            </div>
-          </div>
           <div id="systemPromptModal" class="modal" hidden>
             <div class="modal-card">
-              <div class="modal-title">Системный промпт агента</div>
+              <label class="modal-title" for="systemPromptArea">Системный промпт агента</label>
               <textarea id="systemPromptArea" class="prompt-area" data-setting="agent_system_prompt"></textarea>
               <div class="modal-actions">
                 <button type="button" class="btn ghost" data-modal-close="system">Отмена</button>
@@ -161,7 +167,7 @@
           </div>
           <div id="userPromptModal" class="modal" hidden>
             <div class="modal-card">
-              <div class="modal-title">Промпт агента</div>
+              <label class="modal-title" for="userPromptArea">Промпт агента</label>
               <textarea id="userPromptArea" class="prompt-area" data-setting="agent_prompt"></textarea>
               <div class="modal-actions">
                 <button type="button" class="btn ghost" data-modal-close="user">Отмена</button>
@@ -174,24 +180,24 @@
               <div class="modal-title">Умное объединение реплик</div>
               <div class="grid-2">
                 <div class="field">
-                  <label>Максимум строк</label>
-                  <input data-setting="smart_split_max_lines" type="number" min="1">
+                  <label for="smartSplitMaxLines">Максимум строк</label>
+                  <input id="smartSplitMaxLines" data-setting="smart_split_max_lines" type="number" min="1">
                 </div>
                 <div class="field">
-                  <label>Максимум слов</label>
-                  <input data-setting="smart_split_max_words" type="number" min="1">
+                  <label for="smartSplitMaxWords">Максимум слов</label>
+                  <input id="smartSplitMaxWords" data-setting="smart_split_max_words" type="number" min="1">
                 </div>
                 <div class="field">
-                  <label>Максимум символов</label>
-                  <input data-setting="smart_split_max_chars" type="number" min="1">
+                  <label for="smartSplitMaxChars">Максимум символов</label>
+                  <input id="smartSplitMaxChars" data-setting="smart_split_max_chars" type="number" min="1">
                 </div>
                 <div class="field">
-                  <label>Макс. пауза, мс</label>
-                  <input data-setting="smart_split_max_gap_ms" type="number" min="1">
+                  <label for="smartSplitMaxGap">Макс. пауза, мс</label>
+                  <input id="smartSplitMaxGap" data-setting="smart_split_max_gap_ms" type="number" min="1">
                 </div>
                 <div class="field">
-                  <label>Макс. длительность, мс</label>
-                  <input data-setting="smart_split_max_duration_ms" type="number" min="1">
+                  <label for="smartSplitMaxDuration">Макс. длительность, мс</label>
+                  <input id="smartSplitMaxDuration" data-setting="smart_split_max_duration_ms" type="number" min="1">
                 </div>
               </div>
               <div class="modal-actions">
@@ -208,13 +214,13 @@
       <div class="panel-header">
         <span>Консоль</span>
         <div class="log-actions">
-          <button id="clearLogs" class="btn ghost">Очистить</button>
+          <button id="clearLogs" class="btn ghost" type="button">Очистить</button>
         </div>
       </div>
-      <pre id="logConsole" class="log-console"></pre>
+      <pre id="logConsole" class="log-console" role="log" aria-live="polite"></pre>
     </section>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>

@@ -1,0 +1,12 @@
+sonar.projectKey=sub-translator-py
+sonar.projectName=sub-translator-py
+sonar.sourceEncoding=UTF-8
+
+sonar.sources=sub_translate
+sonar.tests=tests
+sonar.test.inclusions=tests/**/*.py
+sonar.exclusions=resources/**,models/**,logs/**,.venv/**,**/__pycache__/**
+
+sonar.python.version=3.14
+sonar.python.coverage.reportPaths=coverage.xml
+sonar.coverage.exclusions=sub_translate/web/static/**
