@@ -1,3 +1,4 @@
+import os
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,14 @@ def _write_complete_model(path: Path) -> None:
     (path / "config.json").write_text("{}", encoding="utf-8")
     (path / "tokenizer.json").write_text("{}", encoding="utf-8")
     (path / "model.safetensors").write_bytes(b"weights")
+
+
+def _write_snapshot(local_dir: Path, files: dict[str, bytes]) -> None:
+    local_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        output_path = local_dir / name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(content)
 
 
 def _acquire(
@@ -91,15 +100,17 @@ def test_complete_manual_model_with_auto_download_never_touches_hub(tmp_path: Pa
     download.assert_not_called()
 
 
-def test_compatible_pinned_huggingface_cache_is_reused(tmp_path: Path) -> None:
+def test_implicit_path_never_switches_to_huggingface_cache(tmp_path: Path) -> None:
     default_path = tmp_path / "default"
     cached_snapshot = tmp_path / "models--example--model" / "snapshots" / MODEL_REVISION
     _write_complete_model(cached_snapshot)
 
-    with patch("sub_translate.utils.huggingface._download_model_snapshot") as download:
-        source = _acquire(default_path)
+    with (
+        patch("sub_translate.utils.huggingface._download_model_snapshot") as download,
+        pytest.raises(ModelAcquisitionError, match="Каталог модели"),
+    ):
+        _acquire(default_path)
 
-    assert source.path == cached_snapshot.resolve()
     download.assert_not_called()
 
 
@@ -135,9 +146,7 @@ def test_auto_download_uses_env_token_lock_space_check_and_same_directory(
 
     def fake_snapshot_download(*_args, **kwargs) -> str:
         local_dir = Path(kwargs["local_dir"])
-        local_dir.mkdir(parents=True, exist_ok=True)
-        for name, content in files.items():
-            (local_dir / name).write_bytes(content)
+        _write_snapshot(local_dir, files)
         return str(local_dir)
 
     with (
@@ -285,6 +294,206 @@ def test_auto_download_revalidates_required_files(tmp_path: Path) -> None:
             _acquire(tmp_path / "default", auto_download=True)
 
 
+def test_auto_download_replaces_stale_marker_after_complete_snapshot(tmp_path: Path) -> None:
+    target = tmp_path / "selected"
+    _write_complete_model(target)
+    (target / MODEL_MARKER_FILENAME).write_text(
+        '{"model_id":"foreign/model","revision":"ffffffffffffffffffffffffffffffffffffffff"}',
+        encoding="utf-8",
+    )
+    files = {
+        "config.json": b"{}",
+        "tokenizer.json": b"{}",
+        "model.safetensors": b"weights",
+    }
+    model_info = SimpleNamespace(
+        siblings=[SimpleNamespace(rfilename=name, size=len(content)) for name, content in files.items()]
+    )
+
+    def refresh_snapshot(*_args, **kwargs) -> str:
+        local_dir = Path(kwargs["local_dir"])
+        _write_snapshot(local_dir, files)
+        return str(local_dir)
+
+    (target / "model.safetensors").write_bytes(b"foreign")
+    with (
+        patch("huggingface_hub.HfApi") as api_class,
+        patch("huggingface_hub.snapshot_download", side_effect=refresh_snapshot) as download,
+        patch("huggingface_hub.utils.WeakFileLock"),
+        patch(
+            "sub_translate.utils.huggingface.shutil.disk_usage",
+            return_value=SimpleNamespace(free=20 * 1024**3),
+        ),
+    ):
+        api_class.return_value.model_info.return_value = model_info
+        source = _acquire(
+            tmp_path / "default",
+            model_path=target,
+            auto_download=True,
+        )
+
+    assert source.path == target.resolve()
+    assert source.revision_verified is True
+    assert download.call_args.kwargs["force_download"] is True
+    assert Path(download.call_args.kwargs["local_dir"]) != target.resolve()
+    assert (target / "model.safetensors").read_bytes() == files["model.safetensors"]
+    marker = (target / MODEL_MARKER_FILENAME).read_text(encoding="utf-8")
+    assert MODEL_ID in marker
+    assert MODEL_REVISION in marker
+    assert not tuple(tmp_path.glob(".selected.refresh-*"))
+    assert not tuple(tmp_path.glob(".selected.backup-*"))
+
+
+def test_incomplete_download_removes_files_absent_from_pinned_manifest(tmp_path: Path) -> None:
+    target = tmp_path / "selected"
+    target.mkdir()
+    (target / "config.json").write_bytes(b"xx")
+    (target / "model.safetensors").write_bytes(b"foreign-single")
+    (target / "tokenizer_config.json").write_text('{"foreign":true}', encoding="utf-8")
+    (target / "modeling_foreign.py").write_text("raise RuntimeError", encoding="utf-8")
+    metadata_path = target / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    metadata_path.parent.mkdir(parents=True)
+    metadata_path.write_text("resume metadata", encoding="utf-8")
+    files = {
+        "config.json": b"{}",
+        "tokenizer.json": b"{}",
+        "model.safetensors.index.json": (
+            b'{"weight_map":{"layer.0":"model-00001-of-00002.safetensors",'
+            b'"layer.1":"model-00002-of-00002.safetensors"}}'
+        ),
+        "model-00001-of-00002.safetensors": b"first",
+        "model-00002-of-00002.safetensors": b"second",
+    }
+    model_info = SimpleNamespace(
+        siblings=[SimpleNamespace(rfilename=name, size=len(content)) for name, content in files.items()]
+    )
+
+    def download_snapshot(*_args, **kwargs) -> str:
+        local_dir = Path(kwargs["local_dir"])
+        _write_snapshot(local_dir, files)
+        return str(local_dir)
+
+    with (
+        patch("huggingface_hub.HfApi") as api_class,
+        patch("huggingface_hub.snapshot_download", side_effect=download_snapshot) as download,
+        patch("huggingface_hub.utils.WeakFileLock"),
+        patch(
+            "sub_translate.utils.huggingface.shutil.disk_usage",
+            return_value=SimpleNamespace(free=20 * 1024**3),
+        ),
+    ):
+        api_class.return_value.model_info.return_value = model_info
+        source = _acquire(tmp_path / "default", model_path=target, auto_download=True)
+
+    assert source.revision_verified is True
+    assert download.call_args.kwargs["force_download"] is True
+    assert Path(download.call_args.kwargs["local_dir"]) == target.resolve()
+    assert (target / "config.json").read_bytes() == b"{}"
+    assert not (target / "model.safetensors").exists()
+    assert not (target / "tokenizer_config.json").exists()
+    assert not (target / "modeling_foreign.py").exists()
+    assert metadata_path.read_text(encoding="utf-8") == "resume metadata"
+    assert (target / "model-00001-of-00002.safetensors").read_bytes() == b"first"
+    assert (target / "model-00002-of-00002.safetensors").read_bytes() == b"second"
+
+
+def test_failed_forced_refresh_preserves_target_and_removes_staging(tmp_path: Path) -> None:
+    target = tmp_path / "selected"
+    _write_complete_model(target)
+    marker_path = target / MODEL_MARKER_FILENAME
+    marker_path.write_text(
+        '{"model_id":"foreign/model","revision":"ffffffffffffffffffffffffffffffffffffffff"}',
+        encoding="utf-8",
+    )
+    original_files = {
+        path.relative_to(target).as_posix(): path.read_bytes() for path in target.rglob("*") if path.is_file()
+    }
+    model_info = SimpleNamespace(siblings=[SimpleNamespace(rfilename="model.safetensors", size=len(b"replacement"))])
+
+    with (
+        patch("huggingface_hub.HfApi") as api_class,
+        patch("huggingface_hub.snapshot_download", side_effect=RuntimeError("network failed")),
+        patch("huggingface_hub.utils.WeakFileLock"),
+        patch(
+            "sub_translate.utils.huggingface.shutil.disk_usage",
+            return_value=SimpleNamespace(free=20 * 1024**3),
+        ),
+        pytest.raises(ModelAcquisitionError, match="Не удалось загрузить"),
+    ):
+        api_class.return_value.model_info.return_value = model_info
+        _acquire(tmp_path / "default", model_path=target, auto_download=True)
+
+    actual_files = {
+        path.relative_to(target).as_posix(): path.read_bytes() for path in target.rglob("*") if path.is_file()
+    }
+    assert actual_files == original_files
+    assert not tuple(tmp_path.glob(".selected.refresh-*"))
+    assert not tuple(tmp_path.glob(".selected.backup-*"))
+
+
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_failed_atomic_publish_preserves_original_target(tmp_path: Path, *, restore_fails: bool) -> None:
+    target = tmp_path / "selected"
+    _write_complete_model(target)
+    marker_path = target / MODEL_MARKER_FILENAME
+    marker_path.write_text(
+        '{"model_id":"foreign/model","revision":"ffffffffffffffffffffffffffffffffffffffff"}',
+        encoding="utf-8",
+    )
+    original_files = {
+        path.relative_to(target).as_posix(): path.read_bytes() for path in target.rglob("*") if path.is_file()
+    }
+    files = {
+        "config.json": b'{"replacement":true}',
+        "tokenizer.json": b"{}",
+        "model.safetensors": b"replacement",
+    }
+    model_info = SimpleNamespace(
+        siblings=[SimpleNamespace(rfilename=name, size=len(content)) for name, content in files.items()]
+    )
+    real_replace = os.replace
+
+    def fail_staging_publish(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        if source_path.name.startswith(".selected.refresh-") and Path(destination) == target.resolve():
+            raise OSError("publish failed")
+        if restore_fails and source_path.name.startswith(".selected.backup-"):
+            raise OSError("restore failed")
+        real_replace(source, destination)
+
+    def download_snapshot(*_args, **kwargs) -> str:
+        local_dir = Path(kwargs["local_dir"])
+        _write_snapshot(local_dir, files)
+        return str(local_dir)
+
+    with (
+        patch("huggingface_hub.HfApi") as api_class,
+        patch("huggingface_hub.snapshot_download", side_effect=download_snapshot),
+        patch("huggingface_hub.utils.WeakFileLock"),
+        patch(
+            "sub_translate.utils.huggingface.shutil.disk_usage",
+            return_value=SimpleNamespace(free=20 * 1024**3),
+        ),
+        patch("sub_translate.utils.huggingface.os.replace", side_effect=fail_staging_publish),
+        pytest.raises(
+            ModelAcquisitionError,
+            match="исходный каталог" if restore_fails else "атомарно заменить",
+        ),
+    ):
+        api_class.return_value.model_info.return_value = model_info
+        _acquire(tmp_path / "default", model_path=target, auto_download=True)
+
+    preserved_path = next(iter(tmp_path.glob(".selected.backup-*")), target)
+    actual_files = {
+        path.relative_to(preserved_path).as_posix(): path.read_bytes()
+        for path in preserved_path.rglob("*")
+        if path.is_file()
+    }
+    assert actual_files == original_files
+    assert not tuple(tmp_path.glob(".selected.refresh-*"))
+    assert bool(tuple(tmp_path.glob(".selected.backup-*"))) is restore_fails
+
+
 def test_auto_download_rejects_unpinned_revision_before_hub(tmp_path: Path) -> None:
     with (
         patch("huggingface_hub.HfApi") as api_class,
@@ -406,7 +615,7 @@ def test_changed_verified_marker_makes_model_unacceptable(tmp_path: Path) -> Non
             + MODEL_REVISION
             + '","content_fingerprint":"'
             + fingerprint
-            + '"}'
+            + '","fingerprint_version":2}'
         ),
         encoding="utf-8",
     )
@@ -431,6 +640,51 @@ def test_changed_verified_marker_makes_model_unacceptable(tmp_path: Path) -> Non
     ):
         _acquire(tmp_path / "default", model_path=model_path)
     download.assert_not_called()
+
+
+def test_content_fingerprint_detects_middle_only_change(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    weights = model_path / "model.safetensors"
+    payload = bytearray(b"a" * (3 * 1024**2))
+    weights.write_bytes(payload)
+    first = huggingface_utils.model_content_fingerprint(model_path)
+    first_stat = weights.stat()
+
+    payload[len(payload) // 2] = ord("b")
+    weights.write_bytes(payload)
+    os.utime(
+        weights,
+        ns=(first_stat.st_atime_ns, first_stat.st_mtime_ns + 1_000_000_000),
+    )
+    second = huggingface_utils.model_content_fingerprint(model_path)
+
+    assert first is not None
+    assert second is not None
+    assert second != first
+
+
+def test_legacy_marker_remains_unverified_and_is_not_rewritten(tmp_path: Path) -> None:
+    model_path = tmp_path / "selected"
+    _write_complete_model(model_path)
+    marker_path = model_path / MODEL_MARKER_FILENAME
+    marker_path.write_text(
+        (
+            '{"model_id":"example/model","revision":"'
+            + MODEL_REVISION
+            + '","content_fingerprint":"'
+            + ("a" * 64)
+            + '"}'
+        ),
+        encoding="utf-8",
+    )
+    original_marker = marker_path.read_bytes()
+
+    source = _acquire(tmp_path / "default", model_path=model_path)
+
+    assert source.revision_verified is False
+    assert source.content_fingerprint == huggingface_utils.model_content_fingerprint(model_path)
+    assert marker_path.read_bytes() == original_marker
 
 
 def test_lock_timeout_is_reported_as_acquisition_error(tmp_path: Path) -> None:

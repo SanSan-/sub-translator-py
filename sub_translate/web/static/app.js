@@ -226,6 +226,50 @@ function setSelectValueIfExists(select, value) {
   }
 }
 
+function applyStoredCheckbox(input, key, value) {
+  if (key === "allow_cpu_fallback" && input.disabled) {
+    input.checked = false;
+    input.defaultChecked = false;
+    return;
+  }
+  input.checked = Boolean(value);
+  input.defaultChecked = Boolean(value);
+}
+
+function applyStoredNumber(input, key, value, profile) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return;
+  }
+  if (key === "threads") {
+    state.lastThreadValue = String(parsed);
+    if (profile && !profile.thread_safe) {
+      return;
+    }
+  }
+  setInputDefaults(input, parsed);
+}
+
+function applyStoredInput(input, stored, profile) {
+  const key = input.dataset.setting;
+  if (key === "api" || key === "source_lang" || key === "target_lang") {
+    return;
+  }
+  if (!Object.hasOwn(stored, key)) {
+    return;
+  }
+  const value = stored[key];
+  if (input.type === "checkbox") {
+    applyStoredCheckbox(input, key, value);
+    return;
+  }
+  if (input.type === "number") {
+    applyStoredNumber(input, key, value, profile);
+    return;
+  }
+  setInputDefaults(input, value == null ? "" : value);
+}
+
 function applyStoredSettings(stored) {
   if (!stored || typeof stored !== "object") {
     return;
@@ -237,33 +281,7 @@ function applyStoredSettings(stored) {
   const api = apiSelect ? apiSelect.value : "google";
   const profile = getTranslatorProfile(api);
   settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
-    const key = input.dataset.setting;
-    if (key === "api" || key === "source_lang" || key === "target_lang") {
-      return;
-    }
-    if (!Object.hasOwn(stored, key)) {
-      return;
-    }
-    const value = stored[key];
-    if (input.type === "checkbox") {
-      input.checked = Boolean(value);
-      input.defaultChecked = Boolean(value);
-      return;
-    }
-    if (input.type === "number") {
-      const parsed = Number.parseInt(value, 10);
-      if (Number.isFinite(parsed)) {
-        if (key === "threads") {
-          state.lastThreadValue = String(parsed);
-          if (profile && !profile.thread_safe) {
-            return;
-          }
-        }
-        setInputDefaults(input, parsed);
-      }
-      return;
-    }
-    setInputDefaults(input, value == null ? "" : value);
+    applyStoredInput(input, stored, profile);
   });
   setSelectValueIfExists(sourceLangSelect, stored.source_lang);
   const languageConfig = state.uiConfig?.languages?.[api];
@@ -427,6 +445,13 @@ function updateApiDependentUi() {
   setSectionVisibility(agentSections, agentApis.has(api));
   setSectionVisibility(localSections, Boolean(profile?.local));
   setSectionVisibility(localWorkerSections, profile?.runtime_kind === "isolated_worker");
+  if (allowCpuFallbackInput) {
+    const supportsCpuFallback = Boolean(profile?.supports_cpu_fallback);
+    allowCpuFallbackInput.disabled = !supportsCpuFallback;
+    if (!supportsCpuFallback) {
+      allowCpuFallbackInput.checked = false;
+    }
+  }
   const profileTimeout = profile?.default_timeout_seconds || defaults.timeout || 30;
   setInputDefaults(timeoutInput, profileTimeout);
   updateLocalModelMeta(profile);

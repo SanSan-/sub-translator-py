@@ -61,7 +61,24 @@ def test_resolve_api_translategemma_variants() -> None:
 
 
 def test_resolve_api_seedx_alias() -> None:
-    assert resolve_api("seed-x-ppo-7b-awq-int4") == "seedx"
+    assert resolve_api("seed-x-ppo-7b") == "seedx"
+
+
+@pytest.mark.parametrize(
+    ("api", "expected_timeout"),
+    [
+        ("google", 30),
+        ("translategemma", 3_600),
+        ("translategemma-12b", 3_600),
+        ("seedx", 3_600),
+    ],
+)
+def test_processing_settings_use_profile_timeout_by_default(
+    api: str,
+    expected_timeout: int,
+) -> None:
+    assert ProcessingSettings(api=api).timeout == expected_timeout
+    assert ProcessingSettings(api=api, timeout=45).timeout == 45
 
 
 def test_processing_settings_pass_worker_python_to_translation_options(tmp_path: Path) -> None:

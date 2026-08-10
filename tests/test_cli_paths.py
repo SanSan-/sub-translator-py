@@ -159,7 +159,7 @@ def test_parser_resolves_registry_alias_and_rejects_unknown() -> None:
     assert parsed.api == "translategemma"
     parsed_12b = parser.parse_args(["--input", "episode.srt", "--api", "translate-gemma-12b"])
     assert parsed_12b.api == "translategemma-12b"
-    parsed_seedx = parser.parse_args(["--input", "episode.srt", "--api", "seed-x-ppo-7b-awq-int4"])
+    parsed_seedx = parser.parse_args(["--input", "episode.srt", "--api", "seed-x-ppo-7b"])
     assert parsed_seedx.api == "seedx"
     with pytest.raises(SystemExit):
         parser.parse_args(["--input", "episode.srt", "--api", "unknown"])
@@ -168,9 +168,7 @@ def test_parser_resolves_registry_alias_and_rejects_unknown() -> None:
 def test_cli_uses_profile_timeout_unless_user_overrides_it() -> None:
     parser = build_parser()
     slow = parser.parse_args(["--input", "episode.srt", "--api", "seedx"])
-    explicit = parser.parse_args(
-        ["--input", "episode.srt", "--api", "seedx", "--timeout", "45"]
-    )
+    explicit = parser.parse_args(["--input", "episode.srt", "--api", "seedx", "--timeout", "45"])
 
     assert cli._build_processing_settings(slow, slow.api).timeout == 3_600
     assert cli._build_processing_settings(explicit, explicit.api).timeout == 45

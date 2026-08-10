@@ -17,11 +17,11 @@ if TYPE_CHECKING:
 DEFAULT_TRANSLATOR_ID = "google"
 NLLB_600M_MODEL_ID = "facebook/nllb-200-distilled-600M"
 NLLB_600M_MODEL_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
-SEEDX_MODEL_ID = "ByteDance-Seed/Seed-X-PPO-7B-AWQ-Int4"
-SEEDX_MODEL_REVISION = "64a72a40045ac345005795f703a8ba627e99b48e"
+SEEDX_MODEL_ID = "ByteDance-Seed/Seed-X-PPO-7B"
+SEEDX_MODEL_REVISION = "6ef78fc034ec86c0036d7a7ca2bfc24607f48050"
 SEEDX_WORKER_REQUIREMENTS = (
     "accelerate==1.14.0",
-    "compressed-tensors==0.18.0",
+    "bitsandbytes==0.50.0",
     "huggingface_hub==1.27.0",
     "safetensors==0.8.0",
     "tokenizers==0.22.2",
@@ -32,6 +32,7 @@ TRANSLATEGEMMA_MODEL_ID = "google/translategemma-4b-it"
 TRANSLATEGEMMA_MODEL_REVISION = "10042cb0e6e7fdce748996a71dc3dc432a4e0c89"
 TRANSLATEGEMMA_12B_MODEL_ID = "google/translategemma-12b-it"
 TRANSLATEGEMMA_12B_MODEL_REVISION = "d1b225e1caa17f1ddc7e62065d8637d0923f34e2"
+TRANSLATEGEMMA_MAX_BATCH_SIZE = 128
 TRANSLATEGEMMA_PROFILE_IDS = ("translategemma", "translategemma-12b")
 TRANSLATEGEMMA_WORKER_REQUIREMENTS = (
     "torch==2.13.0+cu130",
@@ -45,6 +46,10 @@ TRANSLATEGEMMA_WORKER_REQUIREMENTS = (
     "tokenizers==0.22.2",
 )
 _SAFETENSORS_FILES = (("model.safetensors", "model.safetensors.index.json"),)
+_CONFIG_FILE = "config.json"
+_GENERATION_CONFIG_FILE = "generation_config.json"
+_TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+_TOKENIZER_FILE = "tokenizer.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +78,7 @@ class TranslatorMetadata:
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     quantization: str | None = None
+    supports_cpu_fallback: bool = False
     default_timeout_seconds: int = 30
     deprecated: bool = False
 
@@ -128,10 +134,10 @@ TRANSLATOR_REGISTRY = (
             model_revision=NLLB_600M_MODEL_REVISION,
             model_path=MODELS_DIR / "nllb-200-distilled-600m",
             required_files=(
-                "config.json",
-                "generation_config.json",
-                "tokenizer_config.json",
-                "tokenizer.json",
+                _CONFIG_FILE,
+                _GENERATION_CONFIG_FILE,
+                _TOKENIZER_CONFIG_FILE,
+                _TOKENIZER_FILE,
                 "sentencepiece.bpe.model",
             ),
             required_file_groups=(("pytorch_model.bin",),),
@@ -142,6 +148,7 @@ TRANSLATOR_REGISTRY = (
             estimated_ram_bytes=4 * 1024**3,
             estimated_vram_bytes=4 * 1024**3,
             max_input_tokens=512,
+            supports_cpu_fallback=True,
         ),
         module_name="sub_translate.translators.local.nllb",
         class_name="Nllb600MTranslator",
@@ -164,9 +171,9 @@ TRANSLATOR_REGISTRY = (
             model_revision=TRANSLATEGEMMA_MODEL_REVISION,
             model_path=MODELS_DIR / "translategemma-4b-it",
             required_files=(
-                "config.json",
-                "tokenizer_config.json",
-                "tokenizer.json",
+                _CONFIG_FILE,
+                _TOKENIZER_CONFIG_FILE,
+                _TOKENIZER_FILE,
                 "preprocessor_config.json",
                 "processor_config.json",
             ),
@@ -205,10 +212,10 @@ TRANSLATOR_REGISTRY = (
             model_path=MODELS_DIR / "translategemma-12b-it",
             required_files=(
                 "chat_template.jinja",
-                "config.json",
-                "generation_config.json",
-                "tokenizer_config.json",
-                "tokenizer.json",
+                _CONFIG_FILE,
+                _GENERATION_CONFIG_FILE,
+                _TOKENIZER_CONFIG_FILE,
+                _TOKENIZER_FILE,
                 "preprocessor_config.json",
                 "processor_config.json",
             ),
@@ -232,13 +239,11 @@ TRANSLATOR_REGISTRY = (
     TranslatorRegistration(
         metadata=TranslatorMetadata(
             id="seedx",
-            display_name="Seed-X PPO 7B Int4",
+            display_name="Seed-X PPO 7B (NF4)",
             aliases=(
                 "seed-x",
                 "seed-x-ppo",
                 "seed-x-ppo-7b",
-                "seed-x-ppo-7b-awq",
-                "seed-x-ppo-7b-awq-int4",
             ),
             local=True,
             thread_safe=False,
@@ -246,23 +251,22 @@ TRANSLATOR_REGISTRY = (
             worker_requirements=SEEDX_WORKER_REQUIREMENTS,
             model_id=SEEDX_MODEL_ID,
             model_revision=SEEDX_MODEL_REVISION,
-            model_path=MODELS_DIR / "seed-x-ppo-7b-awq-int4",
+            model_path=MODELS_DIR / "seed-x-ppo-7b",
             required_files=(
-                "config.json",
-                "generation_config.json",
-                "tokenizer_config.json",
-                "tokenizer.json",
+                _CONFIG_FILE,
+                _GENERATION_CONFIG_FILE,
+                _TOKENIZER_FILE,
             ),
             required_file_groups=(("model.safetensors",),),
             supported_directions=(("en", "ru"), ("ru", "en")),
             license_name="OpenMDW",
-            primary_source_url="https://huggingface.co/ByteDance-Seed/Seed-X-PPO-7B-AWQ-Int4",
-            estimated_disk_bytes=5 * 1024**3,
-            estimated_ram_bytes=8 * 1024**3,
-            estimated_vram_bytes=8 * 1024**3,
+            primary_source_url="https://huggingface.co/ByteDance-Seed/Seed-X-PPO-7B",
+            estimated_disk_bytes=15 * 1024**3,
+            estimated_ram_bytes=18 * 1024**3,
+            estimated_vram_bytes=6 * 1024**3,
             max_input_tokens=4_096,
             max_output_tokens=512,
-            quantization="compressed-tensors-awq-int4",
+            quantization="bitsandbytes-nf4-double",
             default_timeout_seconds=3_600,
         ),
         module_name="sub_translate.translators.local.seedx",
@@ -355,13 +359,16 @@ def resolve_registered_model(
         or metadata.model_path is None
     ):
         raise TranslationError(f"Для переводчика {metadata.id} не задана локальная модель.")
+    if options.model_revision is not None and options.model_revision.strip().lower() != metadata.model_revision:
+        raise TranslationError(
+            f"Переводчик {metadata.id} запускается только с закреплённой ревизией {metadata.model_revision}."
+        )
 
     from sub_translate.utils.huggingface import acquire_local_model
 
-    revision = options.model_revision or metadata.model_revision
     return acquire_local_model(
         model_id=metadata.model_id,
-        revision=revision,
+        revision=metadata.model_revision,
         model_path=options.model_path,
         default_model_path=metadata.model_path,
         auto_download=options.auto_download_model,
@@ -380,6 +387,7 @@ __all__ = [
     "SEEDX_WORKER_REQUIREMENTS",
     "TRANSLATEGEMMA_12B_MODEL_ID",
     "TRANSLATEGEMMA_12B_MODEL_REVISION",
+    "TRANSLATEGEMMA_MAX_BATCH_SIZE",
     "TRANSLATEGEMMA_MODEL_ID",
     "TRANSLATEGEMMA_MODEL_REVISION",
     "TRANSLATEGEMMA_PROFILE_IDS",

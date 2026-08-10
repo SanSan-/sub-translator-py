@@ -49,7 +49,6 @@ def test_postprocess_translation_handles_long_exponent_input() -> None:
     [
         ("One two. Three four.", 2, ["One two.", "Three four."]),
         ("one two three", 2, ["one two", "three"]),
-        ("single", 0, ["single"]),
     ],
 )
 def test_split_long_text_preserves_order_and_respects_word_boundaries(
@@ -58,6 +57,36 @@ def test_split_long_text_preserves_order_and_respects_word_boundaries(
     expected: list[str],
 ) -> None:
     assert split_long_text(source, limit, lambda value: len(value.split())) == expected
+
+
+@pytest.mark.parametrize("length", [511, 512, 513])
+def test_split_long_text_respects_limit_for_single_long_token(length: int) -> None:
+    source = "x" * length
+
+    chunks = split_long_text(source, 512, len)
+
+    assert "".join(chunks) == source
+    assert all(0 < len(chunk) <= 512 for chunk in chunks)
+
+
+def test_split_long_text_preserves_unicode_token_without_spaces() -> None:
+    source = "перевод🙂" * 100
+
+    chunks = split_long_text(source, 37, len)
+
+    assert "".join(chunks) == source
+    assert all(0 < len(chunk) <= 37 for chunk in chunks)
+
+
+def test_split_long_text_rejects_impossible_counter_limit() -> None:
+    with pytest.raises(ValueError, match="Невозможно выделить"):
+        split_long_text("abc", 1, lambda _value: 2)
+
+
+@pytest.mark.parametrize("token_limit", [0, -1])
+def test_split_long_text_rejects_non_positive_limit(token_limit: int) -> None:
+    with pytest.raises(ValueError, match="положительным"):
+        split_long_text("single", token_limit, len)
 
 
 def test_translate_text_preserves_empty_lines_and_joins_translated_chunks() -> None:

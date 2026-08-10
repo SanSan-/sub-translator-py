@@ -116,14 +116,18 @@ def test_ui_config_is_registry_driven_and_contains_no_local_paths() -> None:
     assert all("model_path" not in profile for profile in profiles)
     assert all("worker_requirements" not in profile for profile in profiles)
     assert config["languages"].keys() == set(expected_ids)
+    nllb = next(profile for profile in profiles if profile["id"] == "nllb-600m")
+    assert nllb["supports_cpu_fallback"] is True
     profile_12b = next(profile for profile in profiles if profile["id"] == "translategemma-12b")
     assert profile_12b["model"]["id"] == "google/translategemma-12b-it"
     assert profile_12b["model"]["quantization"] == "bitsandbytes-nf4-double"
     assert profile_12b["default_timeout_seconds"] == 3_600
+    assert profile_12b["supports_cpu_fallback"] is False
     seedx = next(profile for profile in profiles if profile["id"] == "seedx")
-    assert seedx["model"]["id"] == "ByteDance-Seed/Seed-X-PPO-7B-AWQ-Int4"
-    assert seedx["model"]["quantization"] == "compressed-tensors-awq-int4"
+    assert seedx["model"]["id"] == "ByteDance-Seed/Seed-X-PPO-7B"
+    assert seedx["model"]["quantization"] == "bitsandbytes-nf4-double"
     assert seedx["default_timeout_seconds"] == 3_600
+    assert seedx["supports_cpu_fallback"] is False
 
 
 def test_translation_settings_normalize_registry_alias_and_optional_paths() -> None:

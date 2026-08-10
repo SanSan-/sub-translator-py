@@ -5,7 +5,9 @@ import json
 import os
 import re
 import shutil
+import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Never
 
@@ -46,6 +48,7 @@ class ModelDirectoryInspection:
     content_fingerprint: str | None = None
     revision_verified: bool = False
     structurally_complete: bool = False
+    files_complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +74,8 @@ DOWNLOAD_RESERVE_RATIO = 0.10
 MODEL_DOWNLOAD_LOCK_TIMEOUT_SECONDS = 600
 _PINNED_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_FINGERPRINT_CHUNK_BYTES = 64 * 1024
+_FULL_FINGERPRINT_CHUNK_BYTES = 4 * 1024**2
+_MODEL_FINGERPRINT_VERSION = 2
 
 
 def _is_nonempty_file(path: Path) -> bool:
@@ -134,45 +138,72 @@ def _inspect_model_marker(
     if not isinstance(marker_fingerprint, str) or not _SHA256_PATTERN.fullmatch(marker_fingerprint):
         issues.append(f"повреждён файл {MODEL_MARKER_FILENAME}")
         return False
-    if marker_fingerprint != content_fingerprint:
+    fingerprint_version = marker.get("fingerprint_version")
+    if fingerprint_version == _MODEL_FINGERPRINT_VERSION:
+        if marker_fingerprint == content_fingerprint:
+            return True
         issues.append("содержимое модели изменено после проверки закреплённой ревизии")
         return False
-    return True
+    if fingerprint_version is None:
+        return False
+    issues.append(f"неподдерживаемая версия отпечатка в {MODEL_MARKER_FILENAME}")
+    return False
+
+
+def _model_files(model_path: Path) -> tuple[Path, ...]:
+    return tuple(
+        sorted(
+            (
+                path
+                for path in model_path.rglob("*")
+                if path.is_file()
+                and path.name != MODEL_MARKER_FILENAME
+                and not path.name.endswith(".incomplete")
+                and ".cache" not in path.relative_to(model_path).parts
+            ),
+            key=lambda path: path.relative_to(model_path).as_posix(),
+        )
+    )
+
+
+@lru_cache(maxsize=16)
+def _full_model_content_fingerprint(
+    manifest: tuple[tuple[str, str, int, int, int], ...],
+) -> str:
+    digest = hashlib.sha256()
+    for absolute_path, relative_path, file_size, _mtime_ns, _ctime_ns in manifest:
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(file_size).encode("ascii"))
+        digest.update(b"\0")
+        with Path(absolute_path).open("rb") as model_file:
+            while chunk := model_file.read(_FULL_FINGERPRINT_CHUNK_BYTES):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def model_content_fingerprint(model_path: Path) -> str | None:
-    """Строит быстрый отпечаток локальных файлов без чтения весов целиком."""
+    """Строит полный SHA-256 локальных файлов и кеширует его по их метаданным."""
     resolved_path = model_path.expanduser().resolve()
     if not resolved_path.is_dir():
         return None
-    files = sorted(
-        (
-            path
-            for path in resolved_path.rglob("*")
-            if path.is_file()
-            and path.name != MODEL_MARKER_FILENAME
-            and not path.name.endswith(".incomplete")
-            and ".cache" not in path.relative_to(resolved_path).parts
-        ),
-        key=lambda path: path.relative_to(resolved_path).as_posix(),
-    )
+    files = _model_files(resolved_path)
     if not files:
         return None
-    digest = hashlib.sha256()
+    manifest: list[tuple[str, str, int, int, int]] = []
     for path in files:
-        relative_path = path.relative_to(resolved_path).as_posix()
         stat = path.stat()
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(stat.st_size).encode("ascii"))
-        digest.update(b"\0")
-        with path.open("rb") as model_file:
-            digest.update(model_file.read(_FINGERPRINT_CHUNK_BYTES))
-            if stat.st_size > _FINGERPRINT_CHUNK_BYTES:
-                model_file.seek(max(0, stat.st_size - _FINGERPRINT_CHUNK_BYTES))
-                digest.update(model_file.read(_FINGERPRINT_CHUNK_BYTES))
-        digest.update(b"\0")
-    return digest.hexdigest()
+        manifest.append(
+            (
+                str(path),
+                path.relative_to(resolved_path).as_posix(),
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+        )
+    return _full_model_content_fingerprint(tuple(manifest))
 
 
 def inspect_model_directory(
@@ -202,6 +233,7 @@ def inspect_model_directory(
             issues.append(f"отсутствует один из файлов: {', '.join(alternatives)}")
 
     _inspect_weight_index(model_path, issues)
+    files_complete = not issues
     content_fingerprint = model_content_fingerprint(model_path)
     if content_fingerprint is None:
         issues.append("каталог модели не содержит проверяемых файлов")
@@ -220,12 +252,8 @@ def inspect_model_directory(
         content_fingerprint,
         revision_verified,
         structurally_complete,
+        files_complete,
     )
-
-
-def _cached_snapshot_path(cache_root: Path, model_id: str, revision: str) -> Path:
-    repository_dir = f"models--{model_id.replace('/', '--')}"
-    return cache_root / repository_dir / "snapshots" / revision
 
 
 def _format_bytes(value: int) -> str:
@@ -233,8 +261,11 @@ def _format_bytes(value: int) -> str:
     return f"{gibibytes:.2f} ГиБ"
 
 
-def _missing_download_bytes(model_info: Any, target_path: Path) -> int:
-    missing_bytes = 0
+def _snapshot_manifest(
+    model_info: Any,
+    target_path: Path,
+) -> tuple[tuple[str, int], ...]:
+    manifest: list[tuple[str, int]] = []
     for sibling in getattr(model_info, "siblings", ()):
         relative_path = getattr(sibling, "rfilename", None)
         file_size = getattr(sibling, "size", None)
@@ -243,10 +274,63 @@ def _missing_download_bytes(model_info: Any, target_path: Path) -> int:
         local_file = _safe_model_child(target_path, relative_path)
         if local_file is None:
             raise ModelAcquisitionError(f"Hugging Face Hub вернул небезопасный путь файла: {relative_path}.")
-        if local_file.is_file() and local_file.stat().st_size == file_size:
+        manifest.append((relative_path, file_size))
+    return tuple(manifest)
+
+
+def _missing_download_bytes(
+    manifest: tuple[tuple[str, int], ...],
+    target_path: Path,
+    *,
+    force_download: bool = False,
+) -> int:
+    missing_bytes = 0
+    for relative_path, file_size in manifest:
+        local_file = _safe_model_child(target_path, relative_path)
+        assert local_file is not None
+        if not force_download and local_file.is_file() and local_file.stat().st_size == file_size:
             continue
         missing_bytes += file_size
     return missing_bytes
+
+
+def _remove_unexpected_model_files(
+    target_path: Path,
+    manifest: tuple[tuple[str, int], ...],
+) -> None:
+    expected_paths = {relative_path.replace("\\", "/") for relative_path, _file_size in manifest}
+    for candidate in target_path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        relative_path = candidate.relative_to(target_path).as_posix()
+        if (
+            relative_path != MODEL_MARKER_FILENAME
+            and ".cache" not in candidate.relative_to(target_path).parts
+            and relative_path not in expected_paths
+        ):
+            candidate.unlink()
+
+
+def _publish_refreshed_model(staging_path: Path, target_path: Path) -> None:
+    backup_path = target_path.parent / f".{target_path.name}.backup-{uuid.uuid4().hex}"
+    target_moved = False
+    try:
+        if target_path.exists():
+            os.replace(target_path, backup_path)
+            target_moved = True
+        os.replace(staging_path, target_path)
+    except OSError:
+        if target_moved and not target_path.exists() and backup_path.exists():
+            try:
+                os.replace(backup_path, target_path)
+            except OSError:
+                raise ModelAcquisitionError(
+                    "Не удалось заменить каталог модели и автоматически восстановить исходный каталог; "
+                    f"его данные сохранены в {backup_path}."
+                ) from None
+        raise ModelAcquisitionError(f"Не удалось атомарно заменить каталог модели {target_path}.") from None
+    if backup_path.exists():
+        shutil.rmtree(backup_path, ignore_errors=True)
 
 
 def _ensure_download_space(target_parent: Path, missing_bytes: int) -> None:
@@ -275,6 +359,7 @@ def _write_model_marker(
                     "model_id": model_id,
                     "revision": revision,
                     "content_fingerprint": content_fingerprint,
+                    "fingerprint_version": _MODEL_FINGERPRINT_VERSION,
                 },
                 marker_file,
                 ensure_ascii=False,
@@ -341,51 +426,70 @@ def _download_model_snapshot(
                     f"Не удалось получить метаданные {model_id} для ревизии {revision}."
                 ) from None
 
-            missing_bytes = _missing_download_bytes(model_info, target_path)
+            refresh_in_staging = (target_path / MODEL_MARKER_FILENAME).exists() and not inspection.revision_verified
+            force_download = target_path.exists()
+            manifest = _snapshot_manifest(model_info, target_path)
+            missing_bytes = _missing_download_bytes(
+                manifest,
+                target_path,
+                force_download=force_download,
+            )
             _ensure_download_space(target_parent, missing_bytes)
+            download_path = (
+                target_parent / f".{target_path.name}.refresh-{uuid.uuid4().hex}"
+                if refresh_in_staging
+                else target_path
+            )
             try:
-                snapshot_download(
-                    repo_id=model_id,
-                    revision=revision,
-                    local_dir=str(target_path),
-                    force_download=False,
-                    token=token,
-                )
-            except Exception:
-                raise ModelAcquisitionError(f"Не удалось загрузить {model_id} в выбранный каталог.") from None
+                try:
+                    snapshot_download(
+                        repo_id=model_id,
+                        revision=revision,
+                        local_dir=str(download_path),
+                        force_download=force_download,
+                        token=token,
+                    )
+                except Exception:
+                    raise ModelAcquisitionError(f"Не удалось загрузить {model_id} в выбранный каталог.") from None
 
-            inspection = inspect_model_directory(
-                target_path,
-                model_id=model_id,
-                revision=revision,
-                required_files=required_files,
-                required_file_groups=required_file_groups,
-            )
-            if not inspection.complete:
-                details = "; ".join(inspection.issues)
-                raise ModelAcquisitionError(f"Каталог модели остался неполным после загрузки: {details}.")
-            assert inspection.content_fingerprint is not None
-            _write_model_marker(
-                target_path,
-                model_id,
-                revision,
-                inspection.content_fingerprint,
-            )
-            verified_inspection = inspect_model_directory(
-                target_path,
-                model_id=model_id,
-                revision=revision,
-                required_files=required_files,
-                required_file_groups=required_file_groups,
-            )
-            if not verified_inspection.complete or not verified_inspection.revision_verified:
-                raise ModelAcquisitionError("Не удалось подтвердить закреплённую ревизию загруженной модели.")
-            return ResolvedLocalModel(
-                target_path,
-                revision,
-                verified_inspection.content_fingerprint,
-                True,
-            )
+                _remove_unexpected_model_files(download_path, manifest)
+                inspection = inspect_model_directory(
+                    download_path,
+                    model_id=model_id,
+                    revision=revision,
+                    required_files=required_files,
+                    required_file_groups=required_file_groups,
+                )
+                if not inspection.files_complete:
+                    details = "; ".join(inspection.issues)
+                    raise ModelAcquisitionError(f"Каталог модели остался неполным после загрузки: {details}.")
+                assert inspection.content_fingerprint is not None
+                _write_model_marker(
+                    download_path,
+                    model_id,
+                    revision,
+                    inspection.content_fingerprint,
+                )
+                verified_inspection = inspect_model_directory(
+                    download_path,
+                    model_id=model_id,
+                    revision=revision,
+                    required_files=required_files,
+                    required_file_groups=required_file_groups,
+                )
+                if not verified_inspection.complete or not verified_inspection.revision_verified:
+                    raise ModelAcquisitionError("Не удалось подтвердить закреплённую ревизию загруженной модели.")
+                if refresh_in_staging:
+                    _publish_refreshed_model(download_path, target_path)
+                return ResolvedLocalModel(
+                    target_path,
+                    revision,
+                    verified_inspection.content_fingerprint,
+                    True,
+                )
+            finally:
+                if refresh_in_staging and download_path.exists():
+                    shutil.rmtree(download_path, ignore_errors=True)
     except TimeoutError as exc:
         raise ModelAcquisitionError(f"Не удалось получить блокировку загрузки модели в {target_path}.") from exc
 
@@ -401,7 +505,7 @@ def acquire_local_model(
     required_file_groups: tuple[tuple[str, ...], ...],
     requires_hf_token: bool = False,
 ) -> ResolvedLocalModel:
-    """Возвращает полную локальную модель либо явно и безопасно докачивает её."""
+    """Возвращает полную локальную модель либо явно и безопасно загружает её."""
     normalized_revision = revision.strip().lower()
     if not _PINNED_REVISION_PATTERN.fullmatch(normalized_revision):
         raise ModelAcquisitionError("Для локальной модели требуется закреплённая 40-символьная SHA-ревизия.")
@@ -425,27 +529,6 @@ def acquire_local_model(
             inspection.content_fingerprint,
             inspection.revision_verified,
         )
-
-    if model_path is None:
-        cached_snapshot = _cached_snapshot_path(
-            default_path.parent,
-            model_id,
-            normalized_revision,
-        ).resolve()
-        cached_inspection = inspect_model_directory(
-            cached_snapshot,
-            model_id=model_id,
-            revision=normalized_revision,
-            required_files=required_files,
-            required_file_groups=required_file_groups,
-        )
-        if cached_inspection.complete:
-            return ResolvedLocalModel(
-                cached_snapshot,
-                normalized_revision,
-                cached_inspection.content_fingerprint,
-                True,
-            )
 
     if not auto_download:
         details = "; ".join(inspection.issues)

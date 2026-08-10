@@ -193,10 +193,15 @@ test("выбор, прогресс, ошибка, кеш и выгрузка м�
   assert.match(await page.locator("#localModelMeta").innerText(), /google\/translategemma-12b-it/);
   assert.match(await page.locator("#localModelMeta").innerText(), /bitsandbytes-nf4-double/);
   assert.equal(await page.locator("#requestTimeout").inputValue(), "3600");
+  assert.equal(await page.locator("#allowCpuFallback").isDisabled(), true);
   await page.selectOption("#translatorApi", "seedx");
-  assert.match(await page.locator("#localModelMeta").innerText(), /ByteDance-Seed\/Seed-X-PPO-7B-AWQ-Int4/);
+  assert.match(await page.locator("#localModelMeta").innerText(), /ByteDance-Seed\/Seed-X-PPO-7B/);
   assert.equal(await page.locator("#requestTimeout").inputValue(), "3600");
   assert.equal(await page.locator("#autoDownloadModel").isChecked(), false);
+  assert.equal(await page.locator("#allowCpuFallback").isDisabled(), true);
+  await page.selectOption("#translatorApi", "nllb-600m");
+  assert.equal(await page.locator("#allowCpuFallback").isDisabled(), false);
+  await page.selectOption("#translatorApi", "seedx");
   assert.deepEqual(
     await page.locator("#targetLang option").evaluateAll((options) => options.map((option) => option.value)),
     ["ru"],
@@ -206,6 +211,16 @@ test("выбор, прогресс, ошибка, кеш и выгрузка м�
     await page.locator("#targetLang option").evaluateAll((options) => options.map((option) => option.value)),
     ["en"],
   );
+  await page.evaluate(() => {
+    localStorage.setItem(
+      "subTranslateSettings",
+      JSON.stringify({api: "seedx", allow_cpu_fallback: true}),
+    );
+  });
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector("#translatorApi")?.value === "seedx");
+  assert.equal(await page.locator("#allowCpuFallback").isDisabled(), true);
+  assert.equal(await page.locator("#allowCpuFallback").isChecked(), false);
   await page.evaluate(() => {
     localStorage.setItem(
       "subTranslateSettings",

@@ -19,13 +19,14 @@ from sub_translate.translators.local.translategemma import (
 from sub_translate.translators.registry import (
     TRANSLATEGEMMA_12B_MODEL_ID,
     TRANSLATEGEMMA_12B_MODEL_REVISION,
+    TRANSLATEGEMMA_MAX_BATCH_SIZE,
     TRANSLATEGEMMA_MODEL_ID,
     TRANSLATEGEMMA_MODEL_REVISION,
     TRANSLATEGEMMA_WORKER_REQUIREMENTS,
     get_translator_metadata,
 )
 from sub_translate.workers import translategemma_worker
-from sub_translate.workers.external_worker import SHUTDOWN_TIMEOUT_SECONDS, ExternalWorkerError
+from sub_translate.workers.external_worker import ExternalWorkerError
 from sub_translate.workers.translategemma_worker import (
     REQUIRED_RUNTIME_VERSIONS,
     TranslateGemmaWorkerRuntime,
@@ -139,6 +140,7 @@ def _patch_model_resolution(
     monkeypatch: pytest.MonkeyPatch,
     model_path: Path,
     revision: str = TRANSLATEGEMMA_MODEL_REVISION,
+    content_fingerprint: str | None = "a" * 64,
 ) -> None:
     monkeypatch.setattr(
         translategemma,
@@ -146,6 +148,7 @@ def _patch_model_resolution(
         lambda _identifier, _options: SimpleNamespace(
             path=model_path,
             revision=revision,
+            content_fingerprint=content_fingerprint,
         ),
     )
 
@@ -258,7 +261,10 @@ def test_worker_loads_only_local_cuda_int8(
     tokenizer = MagicMock()
     model = MagicMock()
     model.is_loaded_in_8bit = True
+    model.hf_quantizer = SimpleNamespace(quantization_config=SimpleNamespace(load_in_8bit=True))
     model.hf_device_map = {"": 0}
+    model.parameters.return_value = [SimpleNamespace(device="cuda:0")]
+    model.buffers.return_value = []
     tokenizer_class = SimpleNamespace(from_pretrained=MagicMock(return_value=tokenizer))
     model_class = SimpleNamespace(from_pretrained=MagicMock(return_value=model))
     quantization_class = MagicMock(return_value="int8-config")
@@ -306,11 +312,14 @@ def test_worker_loads_12b_with_nf4_double_quantization(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype="bfloat16",
     )
     model = MagicMock()
     model.is_loaded_in_4bit = True
     model.hf_quantizer = SimpleNamespace(quantization_config=quantization_state)
     model.hf_device_map = {"": 0}
+    model.parameters.return_value = [SimpleNamespace(device="cuda:0")]
+    model.buffers.return_value = []
     tokenizer_class = SimpleNamespace(from_pretrained=MagicMock(return_value=tokenizer))
     model_class = SimpleNamespace(from_pretrained=MagicMock(return_value=model))
     quantization_class = MagicMock(return_value="nf4-config")
@@ -343,18 +352,100 @@ def test_worker_loads_12b_with_nf4_double_quantization(
     assert "offload_folder" not in model_kwargs
 
 
-@pytest.mark.parametrize("device", ["cpu", "disk"])
+def test_worker_reloads_when_model_content_fingerprint_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _model_directory(tmp_path)
+    metadata = get_translator_metadata("translategemma")
+    runtime = TranslateGemmaWorkerRuntime()
+    models = []
+    for _index in range(2):
+        model = MagicMock()
+        model.is_loaded_in_8bit = True
+        model.hf_quantizer = SimpleNamespace(quantization_config=SimpleNamespace(load_in_8bit=True))
+        model.hf_device_map = {"": 0}
+        model.parameters.return_value = [SimpleNamespace(device="cuda:0")]
+        model.buffers.return_value = []
+        models.append(model)
+    tokenizer_class = SimpleNamespace(from_pretrained=MagicMock(side_effect=[object(), object()]))
+    model_class = SimpleNamespace(from_pretrained=MagicMock(side_effect=models))
+    fake_torch = SimpleNamespace(
+        bfloat16="bfloat16",
+        cuda=SimpleNamespace(
+            OutOfMemoryError=MemoryError,
+            is_available=lambda: True,
+            empty_cache=MagicMock(),
+            ipc_collect=MagicMock(),
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_runtime_modules",
+        lambda: (fake_torch, tokenizer_class, model_class, MagicMock(return_value="int8-config")),
+    )
+
+    runtime._ensure_loaded(metadata, model_path, TRANSLATEGEMMA_MODEL_REVISION, "a" * 64)
+    runtime._ensure_loaded(metadata, model_path, TRANSLATEGEMMA_MODEL_REVISION, "a" * 64)
+    runtime._ensure_loaded(metadata, model_path, TRANSLATEGEMMA_MODEL_REVISION, "b" * 64)
+
+    assert model_class.from_pretrained.call_count == 2
+    assert runtime._load_key[-1] == "b" * 64
+
+
+def test_worker_rejects_invalid_model_content_fingerprint(tmp_path: Path) -> None:
+    model_path = _model_directory(tmp_path)
+    payload = {
+        "profile_id": "translategemma",
+        "model_id": TRANSLATEGEMMA_MODEL_ID,
+        "model_revision": TRANSLATEGEMMA_MODEL_REVISION,
+        "model_path": str(model_path),
+        "model_content_fingerprint": "invalid",
+    }
+    runtime = TranslateGemmaWorkerRuntime()
+
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        runtime.preflight(payload)
+
+
+@pytest.mark.parametrize("device", [1, "cuda", "cuda:1", "cpu", "disk"])
 def test_12b_rejects_cpu_and_disk_placement(device: str) -> None:
     metadata = get_translator_metadata("translategemma-12b")
     quantization = SimpleNamespace(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype="bfloat16",
     )
     model = SimpleNamespace(
         is_loaded_in_4bit=True,
         hf_quantizer=SimpleNamespace(quantization_config=quantization),
         hf_device_map={"model.layers.0": device},
+    )
+
+    with pytest.raises(translategemma_worker.TranslateGemmaRuntimeError, match="вне CUDA"):
+        translategemma_worker._require_cuda_quantization(model, metadata)
+
+
+@pytest.mark.parametrize("provider_name", ["parameters", "buffers"])
+def test_12b_rejects_cpu_tensor_despite_cuda_device_map(provider_name: str) -> None:
+    metadata = get_translator_metadata("translategemma-12b")
+    quantization = SimpleNamespace(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype="bfloat16",
+    )
+    providers = {
+        "parameters": lambda: [SimpleNamespace(device="cuda:0")],
+        "buffers": lambda: [],
+    }
+    providers[provider_name] = lambda: [SimpleNamespace(device="cpu")]
+    model = SimpleNamespace(
+        is_loaded_in_4bit=True,
+        hf_quantizer=SimpleNamespace(quantization_config=quantization),
+        hf_device_map={"": 0},
+        **providers,
     )
 
     with pytest.raises(translategemma_worker.TranslateGemmaRuntimeError, match="вне CUDA"):
@@ -378,6 +469,83 @@ def test_12b_rejects_incomplete_nf4_configuration() -> None:
         translategemma_worker._require_cuda_quantization(model, metadata)
 
 
+def test_12b_rejects_requested_but_not_loaded_nf4() -> None:
+    metadata = get_translator_metadata("translategemma-12b")
+    quantization = SimpleNamespace(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype="bfloat16",
+    )
+    model = SimpleNamespace(
+        is_loaded_in_4bit=False,
+        hf_quantizer=SimpleNamespace(quantization_config=quantization),
+        hf_device_map={"": 0},
+        parameters=lambda: [SimpleNamespace(device="cuda:0")],
+        buffers=lambda: [],
+    )
+
+    with pytest.raises(translategemma_worker.TranslateGemmaRuntimeError, match="квантования"):
+        translategemma_worker._require_cuda_quantization(model, metadata)
+
+
+@pytest.mark.parametrize("attribute", ["load_in_4bit", "bnb_4bit_use_double_quant"])
+@pytest.mark.parametrize("value", [1, "true", "false", object()])
+def test_12b_rejects_non_boolean_nf4_flags(attribute: str, value: object) -> None:
+    metadata = get_translator_metadata("translategemma-12b")
+    quantization = SimpleNamespace(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype="bfloat16",
+    )
+    setattr(quantization, attribute, value)
+    model = SimpleNamespace(
+        is_loaded_in_4bit=True,
+        hf_quantizer=SimpleNamespace(quantization_config=quantization),
+        hf_device_map={"": 0},
+        parameters=lambda: [SimpleNamespace(device="cuda:0")],
+        buffers=lambda: [],
+    )
+
+    with pytest.raises(translategemma_worker.TranslateGemmaRuntimeError, match="квантования"):
+        translategemma_worker._require_cuda_quantization(model, metadata)
+
+
+@pytest.mark.parametrize("value", [1, "true", "false", object()])
+def test_4b_rejects_non_boolean_int8_flag(value: object) -> None:
+    metadata = get_translator_metadata("translategemma")
+    model = SimpleNamespace(
+        is_loaded_in_8bit=True,
+        hf_quantizer=SimpleNamespace(quantization_config=SimpleNamespace(load_in_8bit=value)),
+        hf_device_map={"": 0},
+        parameters=lambda: [SimpleNamespace(device="cuda:0")],
+        buffers=lambda: [],
+    )
+
+    with pytest.raises(translategemma_worker.TranslateGemmaRuntimeError, match="квантования"):
+        translategemma_worker._require_cuda_quantization(model, metadata)
+
+
+@pytest.mark.parametrize("compute_dtype", [None, "float16", "torch.float16"])
+def test_12b_rejects_non_bfloat16_compute_dtype(compute_dtype: object) -> None:
+    metadata = get_translator_metadata("translategemma-12b")
+    quantization = SimpleNamespace(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+    )
+    model = SimpleNamespace(
+        is_loaded_in_4bit=True,
+        hf_quantizer=SimpleNamespace(quantization_config=quantization),
+        hf_device_map={"": 0},
+    )
+
+    with pytest.raises(translategemma_worker.TranslateGemmaRuntimeError, match="квантования"):
+        translategemma_worker._require_cuda_quantization(model, metadata)
+
+
 def test_worker_uses_12b_limits_and_processes_texts_sequentially(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -388,7 +556,7 @@ def test_worker_uses_12b_limits_and_processes_texts_sequentially(
     monkeypatch.setattr(
         TranslateGemmaWorkerRuntime,
         "_ensure_loaded",
-        lambda self, _metadata, _path, _revision: None,
+        lambda self, _metadata, _path, _revision, _fingerprint: None,
     )
 
     def translate_text(
@@ -428,7 +596,7 @@ def test_worker_preserves_batch_cardinality(
     monkeypatch.setattr(
         TranslateGemmaWorkerRuntime,
         "_ensure_loaded",
-        lambda self, _metadata, _path, _revision: None,
+        lambda self, _metadata, _path, _revision, _fingerprint: None,
     )
     monkeypatch.setattr(
         TranslateGemmaWorkerRuntime,
@@ -484,7 +652,59 @@ def test_adapter_sends_parent_resolved_model_and_worker_path(
     assert payload["model_id"] == TRANSLATEGEMMA_MODEL_ID
     assert payload["model_revision"] == TRANSLATEGEMMA_MODEL_REVISION
     assert payload["model_path"] == str(model_path)
+    assert payload["model_content_fingerprint"] == "a" * 64
     assert payload["texts"] == ["First", "Second"]
+
+
+@pytest.mark.parametrize(
+    ("text_count", "expected_chunk_sizes"),
+    [
+        (TRANSLATEGEMMA_MAX_BATCH_SIZE, [TRANSLATEGEMMA_MAX_BATCH_SIZE]),
+        (TRANSLATEGEMMA_MAX_BATCH_SIZE + 1, [TRANSLATEGEMMA_MAX_BATCH_SIZE, 1]),
+        (TRANSLATEGEMMA_MAX_BATCH_SIZE * 2, [TRANSLATEGEMMA_MAX_BATCH_SIZE] * 2),
+    ],
+)
+def test_adapter_splits_large_batches_without_reordering(
+    text_count: int,
+    expected_chunk_sizes: list[int],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _model_directory(tmp_path)
+    requests: list[tuple[str, dict[str, Any], float | None]] = []
+
+    class EchoWorker:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def request(
+            self,
+            command: str,
+            payload: dict[str, Any],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, Any]:
+            requests.append((command, payload, timeout_seconds))
+            return {"translations": [f"ru:{text}" for text in payload["texts"]]}
+
+        def abort(self) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(translategemma, "PersistentNdjsonWorker", EchoWorker)
+    _patch_model_resolution(monkeypatch, model_path)
+    texts = [f"item-{index}" for index in range(text_count)]
+
+    result = TranslateGemmaTranslator(timeout=91).translate_batch(
+        texts,
+        TranslationOptions(source_lang="en", target_lang="ru"),
+    )
+
+    assert result == [f"ru:{text}" for text in texts]
+    assert [len(payload["texts"]) for _command, payload, _timeout in requests] == expected_chunk_sizes
+    assert all(timeout == 91 for _command, _payload, timeout in requests)
 
 
 def test_12b_adapter_sends_own_canonical_profile(
@@ -524,7 +744,7 @@ def test_switching_4b_and_12b_restarts_shared_process(
     def resolve_model(identifier: str, _options: TranslationOptions) -> SimpleNamespace:
         metadata = get_translator_metadata(identifier)
         path = model_4b if identifier == "translategemma" else model_12b
-        return SimpleNamespace(path=path, revision=metadata.model_revision)
+        return SimpleNamespace(path=path, revision=metadata.model_revision, content_fingerprint="a" * 64)
 
     monkeypatch.setattr(translategemma, "resolve_registered_model", resolve_model)
     options = TranslationOptions(source_lang="en", target_lang="ru")
@@ -556,9 +776,8 @@ def test_different_instances_share_one_worker_and_class_unload_stops_it(
 
     assert len(workers) == 1
     commands = [command for command, _payload, _timeout in workers[0].requests]
-    assert commands == ["translate", "translate", "unload"]
+    assert commands == ["translate", "translate"]
     assert [timeout for _command, _payload, timeout in workers[0].requests[:2]] == [10, 20]
-    assert workers[0].requests[-1][2] == SHUTDOWN_TIMEOUT_SECONDS
     assert workers[0].shutdown_calls == 1
     assert TranslateGemmaTranslator._worker is None
 
@@ -645,15 +864,29 @@ def test_unsupported_direction_is_rejected_before_worker(
     assert workers == []
 
 
-def test_cpu_fallback_and_unpinned_revision_are_rejected(
+def test_cpu_fallback_flag_is_ignored_for_cuda_only_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _model_directory(tmp_path)
+    workers = _install_worker_factory(monkeypatch, [{"translations": ["Перевод"]}])
+    _patch_model_resolution(monkeypatch, model_path)
+
+    result = TranslateGemmaTranslator().translate_batch(
+        ["Text"],
+        TranslationOptions(source_lang="en", target_lang="ru", allow_cpu_fallback=True),
+    )
+
+    assert result == ["Перевод"]
+    assert len(workers) == 1
+
+
+def test_unpinned_revision_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path = _model_directory(tmp_path)
     translator = TranslateGemmaTranslator()
-    cpu_options = TranslationOptions(allow_cpu_fallback=True)
-    with pytest.raises(TranslationError, match="CPU"):
-        translator.translate_batch(["Text"], cpu_options)
 
     _patch_model_resolution(monkeypatch, model_path, revision="0" * 40)
     default_options = TranslationOptions()

@@ -7,10 +7,11 @@ import threading
 from pathlib import Path
 from typing import Any, ClassVar
 
-from sub_translate.dictionaries.languages import get_code
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
+from sub_translate.translators.local.common import normalize_language, validate_worker_translations
 from sub_translate.translators.registry import (
+    TRANSLATEGEMMA_MAX_BATCH_SIZE,
     TRANSLATEGEMMA_MODEL_ID,
     TRANSLATEGEMMA_MODEL_REVISION,
     TRANSLATEGEMMA_PROFILE_IDS,
@@ -19,7 +20,6 @@ from sub_translate.translators.registry import (
 )
 from sub_translate.workers.external_worker import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    SHUTDOWN_TIMEOUT_SECONDS,
     ExternalWorkerError,
     PersistentNdjsonWorker,
 )
@@ -28,12 +28,6 @@ MODEL_NAME = TRANSLATEGEMMA_MODEL_ID
 MODEL_REVISION = TRANSLATEGEMMA_MODEL_REVISION
 WORKER_MODULE = "sub_translate.workers.translategemma_worker"
 SUPPORTED_DIRECTIONS = (("en", "ru"), ("ru", "en"))
-_LANGUAGE_ALIASES = {
-    "английский": "en",
-    "русский": "ru",
-    "eng": "en",
-    "rus": "ru",
-}
 
 
 class TranslateGemmaTranslator:
@@ -55,11 +49,6 @@ class TranslateGemmaTranslator:
     def translate_batch(self, texts: list[str], options: TranslationOptions) -> list[str]:
         if not texts:
             return []
-        if options.allow_cpu_fallback:
-            raise TranslationError(
-                "TranslateGemma работает только в CUDA с квантованием выбранного профиля; "
-                "переход на CPU отключён."
-            )
         if not all(isinstance(text, str) for text in texts):
             raise TranslationError("Пачка TranslateGemma должна состоять только из строк.")
         source_lang, target_lang = _resolve_direction(options)
@@ -71,19 +60,14 @@ class TranslateGemmaTranslator:
             "model_id": metadata.model_id,
             "model_revision": model_source.revision,
             "model_path": str(model_source.path),
+            "model_content_fingerprint": model_source.content_fingerprint,
             "source_lang": source_lang,
             "target_lang": target_lang,
-            "texts": list(texts),
         }
         with TranslateGemmaTranslator._worker_lock:
             worker = TranslateGemmaTranslator._worker_for(python_path, self.name)
             try:
-                response = worker.request(
-                    "translate",
-                    payload,
-                    timeout_seconds=self._timeout,
-                )
-                return _validate_response(response, texts)
+                return _translate_chunks(worker, payload, texts, self._timeout)
             except ExternalWorkerError as exc:
                 TranslateGemmaTranslator._discard_worker()
                 raise TranslationError(_worker_error_message(exc)) from exc
@@ -101,15 +85,6 @@ class TranslateGemmaTranslator:
             owner._worker_python = None
             owner._worker_profile_id = None
             if worker is None:
-                return
-            try:
-                worker.request(
-                    "unload",
-                    {},
-                    timeout_seconds=SHUTDOWN_TIMEOUT_SECONDS,
-                )
-            except ExternalWorkerError:
-                worker.abort()
                 return
             worker.shutdown()
 
@@ -153,6 +128,24 @@ def _resolve_model(
     return model_source
 
 
+def _translate_chunks(
+    worker: PersistentNdjsonWorker,
+    payload: dict[str, Any],
+    texts: list[str],
+    timeout_seconds: float,
+) -> list[str]:
+    translations: list[str] = []
+    for start in range(0, len(texts), TRANSLATEGEMMA_MAX_BATCH_SIZE):
+        chunk = texts[start : start + TRANSLATEGEMMA_MAX_BATCH_SIZE]
+        response = worker.request(
+            "translate",
+            {**payload, "texts": chunk},
+            timeout_seconds=timeout_seconds,
+        )
+        translations.extend(validate_worker_translations(response, chunk, "TranslateGemma"))
+    return translations
+
+
 def _resolve_worker_python(options: TranslationOptions) -> Path:
     python_path = Path(options.worker_python_path or sys.executable).expanduser().resolve()
     if not python_path.is_file():
@@ -161,39 +154,14 @@ def _resolve_worker_python(options: TranslationOptions) -> Path:
 
 
 def _resolve_direction(options: TranslationOptions) -> tuple[str, str]:
-    source_lang = _normalize_language(options.source_lang, default="en")
-    target_lang = _normalize_language(options.target_lang, default="ru")
+    source_lang = normalize_language(options.source_lang, default="en")
+    target_lang = normalize_language(options.target_lang, default="ru")
     if (source_lang, target_lang) not in SUPPORTED_DIRECTIONS:
         raise TranslationError(
             "TranslateGemma поддерживает только направления en -> ru и ru -> en "
             f"(получено {source_lang} -> {target_lang})."
         )
     return source_lang, target_lang
-
-
-def _normalize_language(value: str | None, *, default: str) -> str:
-    if not value or not value.strip() or value.strip().casefold() == "auto":
-        return default
-    normalized = value.strip().casefold()
-    normalized = _LANGUAGE_ALIASES.get(normalized, normalized)
-    return get_code(normalized) or normalized
-
-
-def _validate_response(response: dict[str, Any], texts: list[str]) -> list[str]:
-    raw_translations = response.get("translations")
-    if not isinstance(raw_translations, list):
-        raise TranslationError("Процесс TranslateGemma не вернул список переводов.")
-    if len(raw_translations) != len(texts):
-        raise TranslationError(
-            "Процесс TranslateGemma вернул другое число переводов: "
-            f"ожидалось {len(texts)}, получено {len(raw_translations)}."
-        )
-    if not all(isinstance(item, str) for item in raw_translations):
-        raise TranslationError("Процесс TranslateGemma вернул значение, которое не является строкой.")
-    translations = [str(item) for item in raw_translations]
-    if any(source and not translation.strip() for source, translation in zip(texts, translations, strict=True)):
-        raise TranslationError("Процесс TranslateGemma вернул пустой перевод непустой строки.")
-    return translations
 
 
 def _worker_error_message(error: ExternalWorkerError) -> str:

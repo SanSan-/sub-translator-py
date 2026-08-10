@@ -118,11 +118,8 @@ class PersistentNdjsonWorker:
             if process is None:
                 return
             if process.poll() is None:
-                try:
+                with suppress(ExternalWorkerError):
                     self._request_locked("shutdown", {}, SHUTDOWN_TIMEOUT_SECONDS)
-                    process.wait(timeout=1.0)
-                except ExternalWorkerError, subprocess.TimeoutExpired:
-                    pass
             self._terminate_locked(process)
 
     def _request_locked(

@@ -78,7 +78,7 @@ class ProcessingSettings:
     thread_count: int = DEFAULT_THREAD_COUNT
     smart_split: bool = False
     smart_split_settings: SmartSplitSettings | None = None
-    timeout: int = 30
+    timeout: int | None = None
     force: bool = False
     tld: str = "com"
     request_delay_ms: int | None = None
@@ -97,10 +97,14 @@ class ProcessingSettings:
             raise ValueError("Исходный и целевой языки не должны быть пустыми.")
         if not isinstance(self.api, str) or not self.api.strip():
             raise ValueError("Переводчик должен быть выбран явно.")
+        resolved_api = resolve_api(self.api)
+        resolved_timeout = self.timeout
+        if resolved_timeout is None:
+            resolved_timeout = get_translator_metadata(resolved_api).default_timeout_seconds
         for value, label in (
             (self.batch_size, "Размер пачки"),
             (self.thread_count, "Число потоков"),
-            (self.timeout, "Время ожидания"),
+            (resolved_timeout, "Время ожидания"),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{label} должно быть положительным целым числом.")
@@ -112,7 +116,8 @@ class ProcessingSettings:
             raise ValueError("Задержка между запросами не должна быть отрицательной.")
         object.__setattr__(self, "source_lang", source_lang)
         object.__setattr__(self, "target_lang", target_lang)
-        object.__setattr__(self, "api", resolve_api(self.api))
+        object.__setattr__(self, "api", resolved_api)
+        object.__setattr__(self, "timeout", resolved_timeout)
         object.__setattr__(self, "tld", normalize_google_tld(self.tld))
         if self.model_path is not None:
             object.__setattr__(self, "model_path", Path(self.model_path).expanduser().resolve())

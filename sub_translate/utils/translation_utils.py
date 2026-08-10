@@ -82,6 +82,12 @@ def _split_sentence_by_words(
     result: list[str] = []
     piece: list[str] = []
     for word in sentence.split():
+        if token_counter(word) > token_limit:
+            if piece:
+                result.append(" ".join(piece))
+                piece = []
+            result.extend(_split_oversized_token(word, token_limit, token_counter))
+            continue
         tentative = " ".join([*piece, word])
         if piece and token_counter(tentative) > token_limit:
             result.append(" ".join(piece))
@@ -90,6 +96,34 @@ def _split_sentence_by_words(
             piece.append(word)
     if piece:
         result.append(" ".join(piece))
+    return result
+
+
+def _split_oversized_token(
+    token: str,
+    token_limit: int,
+    token_counter: Callable[[str], int],
+) -> list[str]:
+    result: list[str] = []
+    remainder = token
+    while remainder:
+        if token_counter(remainder) <= token_limit:
+            result.append(remainder)
+            break
+        lower = 1
+        upper = len(remainder)
+        best = 0
+        while lower <= upper:
+            middle = (lower + upper) // 2
+            if token_counter(remainder[:middle]) <= token_limit:
+                best = middle
+                lower = middle + 1
+            else:
+                upper = middle - 1
+        if best == 0:
+            raise ValueError("Невозможно выделить непустой фрагмент в заданный предел токенов.")
+        result.append(remainder[:best])
+        remainder = remainder[best:]
     return result
 
 
@@ -114,6 +148,8 @@ def split_long_text(text: str, token_limit: int, token_counter: Callable[[str], 
 
     Использует предложенный `token_counter` для оценки длины.
     """
+    if token_limit <= 0:
+        raise ValueError("Предел токенов должен быть положительным.")
     if token_counter(text) <= token_limit:
         return [text]
 

@@ -171,6 +171,7 @@ def test_verified_revision_is_stable_and_cache_hit_has_no_network_or_secret_read
                 "model_id": metadata.model_id,
                 "revision": metadata.model_revision,
                 "content_fingerprint": fingerprint,
+                "fingerprint_version": 2,
             },
             ensure_ascii=False,
             separators=(",", ":"),

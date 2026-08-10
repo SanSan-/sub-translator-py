@@ -509,6 +509,7 @@ def _safe_translator_metadata(metadata: TranslatorMetadata) -> dict[str, Any]:
         "local": metadata.local,
         "thread_safe": metadata.thread_safe,
         "runtime_kind": metadata.runtime_kind,
+        "supports_cpu_fallback": metadata.supports_cpu_fallback,
         "default_timeout_seconds": metadata.default_timeout_seconds,
         "supported_directions": [
             {"source": source, "target": target} for source, target in metadata.supported_directions

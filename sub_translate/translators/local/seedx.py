@@ -7,9 +7,9 @@ import threading
 from pathlib import Path
 from typing import Any, ClassVar
 
-from sub_translate.dictionaries.languages import get_code
 from sub_translate.models import TranslationOptions
 from sub_translate.translators.base import TranslationError
+from sub_translate.translators.local.common import normalize_language, validate_worker_translations
 from sub_translate.translators.registry import (
     SEEDX_MODEL_ID,
     SEEDX_MODEL_REVISION,
@@ -17,7 +17,6 @@ from sub_translate.translators.registry import (
 )
 from sub_translate.workers.external_worker import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    SHUTDOWN_TIMEOUT_SECONDS,
     ExternalWorkerError,
     PersistentNdjsonWorker,
 )
@@ -26,12 +25,6 @@ MODEL_NAME = SEEDX_MODEL_ID
 MODEL_REVISION = SEEDX_MODEL_REVISION
 WORKER_MODULE = "sub_translate.workers.seedx_worker"
 SUPPORTED_DIRECTIONS = (("en", "ru"), ("ru", "en"))
-_LANGUAGE_ALIASES = {
-    "английский": "en",
-    "русский": "ru",
-    "eng": "en",
-    "rus": "ru",
-}
 
 
 class SeedXTranslator:
@@ -50,8 +43,6 @@ class SeedXTranslator:
     def translate_batch(self, texts: list[str], options: TranslationOptions) -> list[str]:
         if not texts:
             return []
-        if options.allow_cpu_fallback:
-            raise TranslationError("Seed-X работает только в CUDA Int4; переход на CPU отключён.")
         if not all(isinstance(text, str) for text in texts):
             raise TranslationError("Пачка Seed-X должна состоять только из строк.")
 
@@ -62,6 +53,7 @@ class SeedXTranslator:
             "model_id": SEEDX_MODEL_ID,
             "model_revision": model_source.revision,
             "model_path": str(model_source.path),
+            "model_content_fingerprint": model_source.content_fingerprint,
             "source_lang": source_lang,
             "target_lang": target_lang,
         }
@@ -75,7 +67,7 @@ class SeedXTranslator:
                         {**common_payload, "texts": [text]},
                         timeout_seconds=self._timeout,
                     )
-                    translations.extend(_validate_response(response, [text]))
+                    translations.extend(validate_worker_translations(response, [text], "Seed-X"))
             except ExternalWorkerError as exc:
                 type(self)._discard_worker()
                 raise TranslationError(_worker_error_message(exc)) from exc
@@ -92,15 +84,6 @@ class SeedXTranslator:
             cls._worker = None
             cls._worker_python = None
             if worker is None:
-                return
-            try:
-                worker.request(
-                    "unload",
-                    {},
-                    timeout_seconds=SHUTDOWN_TIMEOUT_SECONDS,
-                )
-            except ExternalWorkerError:
-                worker.abort()
                 return
             worker.shutdown()
 
@@ -144,54 +127,22 @@ def _resolve_worker_python(options: TranslationOptions) -> Path:
 
 
 def _resolve_direction(options: TranslationOptions) -> tuple[str, str]:
-    source_lang = _normalize_language(options.source_lang, default="en")
-    target_lang = _normalize_language(options.target_lang, default="ru")
+    source_lang = normalize_language(options.source_lang, default="en")
+    target_lang = normalize_language(options.target_lang, default="ru")
     if (source_lang, target_lang) not in SUPPORTED_DIRECTIONS:
         raise TranslationError(
-            "Seed-X поддерживает только направления en -> ru и ru -> en "
-            f"(получено {source_lang} -> {target_lang})."
+            f"Seed-X поддерживает только направления en -> ru и ru -> en (получено {source_lang} -> {target_lang})."
         )
     return source_lang, target_lang
 
 
-def _normalize_language(value: str | None, *, default: str) -> str:
-    if not value or not value.strip() or value.strip().casefold() == "auto":
-        return default
-    normalized = value.strip().casefold()
-    normalized = _LANGUAGE_ALIASES.get(normalized, normalized)
-    return get_code(normalized) or normalized
-
-
-def _validate_response(response: dict[str, Any], texts: list[str]) -> list[str]:
-    raw_translations = response.get("translations")
-    if not isinstance(raw_translations, list):
-        raise TranslationError("Процесс Seed-X не вернул список переводов.")
-    if len(raw_translations) != len(texts):
-        raise TranslationError(
-            "Процесс Seed-X вернул другое число переводов: "
-            f"ожидалось {len(texts)}, получено {len(raw_translations)}."
-        )
-    if not all(isinstance(item, str) for item in raw_translations):
-        raise TranslationError("Процесс Seed-X вернул значение, которое не является строкой.")
-    translations = [str(item) for item in raw_translations]
-    if any(source and not translation.strip() for source, translation in zip(texts, translations, strict=True)):
-        raise TranslationError("Процесс Seed-X вернул пустой перевод непустой строки.")
-    return translations
-
-
 def _worker_error_message(error: ExternalWorkerError) -> str:
     if error.error_type in {"SeedXOutOfMemoryError", "OutOfMemoryError"}:
-        return (
-            "Seed-X не хватило видеопамяти. Изолированный процесс остановлен; "
-            "следующий вызов запустит его заново."
-        )
+        return "Seed-X не хватило видеопамяти. Изолированный процесс остановлен; следующий вызов запустит его заново."
     if error.error_type == "TimeoutError":
         return "Seed-X превысила таймаут. Изолированный процесс остановлен; следующий вызов запустит его заново."
     if error.error_type in {"ProtocolError", "WorkerExited"}:
-        return (
-            "Изолированный процесс Seed-X завершился или нарушил протокол. "
-            "Следующий вызов запустит его заново."
-        )
+        return "Изолированный процесс Seed-X завершился или нарушил протокол. Следующий вызов запустит его заново."
     return f"Ошибка изолированной Seed-X: {error}"
 
 

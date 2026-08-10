@@ -13,13 +13,19 @@ from types import MappingProxyType
 from typing import Any
 
 from sub_translate.translators.registry import (
+    TRANSLATEGEMMA_MAX_BATCH_SIZE,
     TRANSLATEGEMMA_PROFILE_IDS,
     TRANSLATEGEMMA_WORKER_REQUIREMENTS,
     TranslatorMetadata,
     get_translator_metadata,
 )
 from sub_translate.utils.translation_utils import translate_text as translate_text_common
-from sub_translate.workers.common import PublicWorkerError, run_worker_loop
+from sub_translate.workers.common import (
+    PublicWorkerError,
+    model_uses_only_device,
+    run_worker_loop,
+    validate_model_content_fingerprint,
+)
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -35,7 +41,7 @@ def _required_runtime_versions() -> Mapping[str, str]:
 
 
 REQUIRED_RUNTIME_VERSIONS = _required_runtime_versions()
-MAX_BATCH_SIZE = 128
+MAX_BATCH_SIZE = TRANSLATEGEMMA_MAX_BATCH_SIZE
 MAX_MODEL_INPUT = 512
 MAX_OUTPUT_LENGTH = 1_024
 DEVICE = "cuda:0"
@@ -63,20 +69,26 @@ class TranslateGemmaWorkerRuntime:
         self._tokenizer: Any | None = None
         self._model: Any | None = None
         self._torch: Any | None = None
-        self._load_key: tuple[str, str, str, str] | None = None
+        self._load_key: tuple[str, str, str, str, str | None] | None = None
         self._modules: tuple[Any, Any, Any, Any] | None = None
 
     def preflight(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Проверяет среду, CUDA и локальный каталог без загрузки весов."""
-        metadata, model_path, revision = _validate_model_request(payload)
+        metadata, model_path, revision, content_fingerprint = _validate_model_request(payload)
         torch, _tokenizer_class, _model_class, _quantization_class = self._runtime_modules()
         if not bool(torch.cuda.is_available()):
             raise TranslateGemmaRuntimeError("Для TranslateGemma требуется CUDA; переход на CPU отключён.")
-        return _runtime_signature(metadata, model_path, revision, loaded=self._model is not None)
+        return _runtime_signature(
+            metadata,
+            model_path,
+            revision,
+            content_fingerprint,
+            loaded=self._model is not None,
+        )
 
     def translate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Последовательно переводит пачку с проверкой её мощности."""
-        metadata, model_path, revision = _validate_model_request(payload)
+        metadata, model_path, revision, content_fingerprint = _validate_model_request(payload)
         source_lang, target_lang = _validate_direction(payload)
         texts = _validate_texts(payload.get("texts"))
         if not texts or not any(texts):
@@ -86,10 +98,11 @@ class TranslateGemmaWorkerRuntime:
                     metadata,
                     model_path,
                     revision,
+                    content_fingerprint,
                     loaded=self._model is not None,
                 ),
             }
-        self._ensure_loaded(metadata, model_path, revision)
+        self._ensure_loaded(metadata, model_path, revision, content_fingerprint)
         translations = [
             ""
             if not text
@@ -106,7 +119,7 @@ class TranslateGemmaWorkerRuntime:
             raise TranslateGemmaRuntimeError("TranslateGemma нарушила мощность входной пачки.")
         return {
             "translations": translations,
-            "runtime": _runtime_signature(metadata, model_path, revision, loaded=True),
+            "runtime": _runtime_signature(metadata, model_path, revision, content_fingerprint, loaded=True),
         }
 
     def unload(self) -> dict[str, Any]:
@@ -120,8 +133,20 @@ class TranslateGemmaWorkerRuntime:
             self._torch.cuda.ipc_collect()
         return {"unloaded": True}
 
-    def _ensure_loaded(self, metadata: TranslatorMetadata, model_path: Path, revision: str) -> None:
-        load_key = (metadata.id, str(model_path).casefold(), revision, metadata.quantization or "")
+    def _ensure_loaded(
+        self,
+        metadata: TranslatorMetadata,
+        model_path: Path,
+        revision: str,
+        content_fingerprint: str | None = None,
+    ) -> None:
+        load_key = (
+            metadata.id,
+            str(model_path).casefold(),
+            revision,
+            metadata.quantization or "",
+            content_fingerprint,
+        )
         if self._model is not None and self._tokenizer is not None and self._load_key == load_key:
             return
         if self._model is not None or self._tokenizer is not None:
@@ -286,7 +311,7 @@ def translation_messages(
     ]
 
 
-def _validate_model_request(payload: Mapping[str, Any]) -> tuple[TranslatorMetadata, Path, str]:
+def _validate_model_request(payload: Mapping[str, Any]) -> tuple[TranslatorMetadata, Path, str, str | None]:
     profile_id = str(payload.get("profile_id") or "").strip().casefold()
     if profile_id not in TRANSLATEGEMMA_PROFILE_IDS:
         raise TranslateGemmaRuntimeError("Запрос относится к неизвестному профилю TranslateGemma.")
@@ -311,7 +336,8 @@ def _validate_model_request(payload: Mapping[str, Any]) -> tuple[TranslatorMetad
         for alternatives in metadata.required_file_groups
     ):
         raise TranslateGemmaRuntimeError("Каталог TranslateGemma не содержит safetensors-веса.")
-    return metadata, model_path, revision
+    content_fingerprint = validate_model_content_fingerprint(payload.get("model_content_fingerprint"))
+    return metadata, model_path, revision, content_fingerprint
 
 
 def _validate_direction(payload: Mapping[str, Any]) -> tuple[str, str]:
@@ -387,16 +413,17 @@ def _require_cuda_quantization(model: Any, metadata: TranslatorMetadata) -> None
     quantizer = getattr(model, "hf_quantizer", None)
     quantization = getattr(quantizer, "quantization_config", None)
     if metadata.quantization == "bitsandbytes-int8":
-        loaded = bool(getattr(model, "is_loaded_in_8bit", False)) or bool(
-            getattr(quantization, "load_in_8bit", False)
+        loaded = (
+            getattr(model, "is_loaded_in_8bit", False) is True and getattr(quantization, "load_in_8bit", False) is True
         )
     elif metadata.quantization == "bitsandbytes-nf4-double":
-        loaded = bool(getattr(model, "is_loaded_in_4bit", False)) or bool(
-            getattr(quantization, "load_in_4bit", False)
+        loaded = (
+            getattr(model, "is_loaded_in_4bit", False) is True and getattr(quantization, "load_in_4bit", False) is True
         )
         quant_type = str(getattr(quantization, "bnb_4bit_quant_type", "")).casefold()
-        double_quant = bool(getattr(quantization, "bnb_4bit_use_double_quant", False))
-        loaded = loaded and quant_type == "nf4" and double_quant
+        double_quant = getattr(quantization, "bnb_4bit_use_double_quant", False) is True
+        compute_dtype = str(getattr(quantization, "bnb_4bit_compute_dtype", "")).casefold()
+        loaded = loaded and quant_type == "nf4" and double_quant and compute_dtype in {"bfloat16", "torch.bfloat16"}
     else:
         loaded = False
     if not loaded:
@@ -405,29 +432,21 @@ def _require_cuda_quantization(model: Any, metadata: TranslatorMetadata) -> None
 
 
 def _require_cuda_placement(model: Any) -> None:
-    device_map = getattr(model, "hf_device_map", None)
-    if isinstance(device_map, Mapping):
-        devices = tuple(device_map.values())
-        if not devices or any(not _is_cuda_device(value) for value in devices):
-            raise TranslateGemmaRuntimeError("Часть TranslateGemma оказалась вне CUDA; CPU-переход отключён.")
-        return
-    parameters = getattr(model, "parameters", None)
-    if not callable(parameters):
-        raise TranslateGemmaRuntimeError("TranslateGemma не сообщает размещение параметров.")
-    if any(getattr(parameter.device, "type", "") != "cuda" for parameter in parameters()):
+    if not model_uses_only_device(model, _is_cuda_device):
         raise TranslateGemmaRuntimeError("Часть TranslateGemma оказалась вне CUDA; CPU-переход отключён.")
 
 
 def _is_cuda_device(value: Any) -> bool:
     if isinstance(value, int):
-        return value >= 0
-    return str(value).casefold().startswith("cuda")
+        return value == 0
+    return str(value).strip().casefold() == DEVICE
 
 
 def _runtime_signature(
     metadata: TranslatorMetadata,
     model_path: Path,
     revision: str,
+    content_fingerprint: str | None,
     *,
     loaded: bool,
 ) -> dict[str, Any]:
@@ -437,6 +456,7 @@ def _runtime_signature(
         "model_id": metadata.model_id,
         "model_revision": revision,
         "model_path": str(model_path),
+        "model_content_fingerprint": content_fingerprint,
         "device": DEVICE,
         "quantization": metadata.quantization,
         "decoding": "greedy",

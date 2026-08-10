@@ -40,7 +40,7 @@ def test_registry_contains_all_supported_translators() -> None:
         (" google-translate-api ", "google"),
         ("OPENAI", "agent"),
         ("nllb-200-distilled-600m", "nllb-600m"),
-        ("seed-x-ppo-7b-awq-int4", "seedx"),
+        ("seed-x-ppo-7b", "seedx"),
         ("translate-gemma-4b", "translategemma"),
         ("translate-gemma-12b-it", "translategemma-12b"),
     ],
@@ -120,17 +120,22 @@ def test_seedx_metadata_is_pinned_and_isolated() -> None:
     metadata = get_translator_metadata("seed-x-ppo")
 
     assert metadata.id == "seedx"
-    assert metadata.display_name == "Seed-X PPO 7B Int4"
-    assert metadata.model_id == "ByteDance-Seed/Seed-X-PPO-7B-AWQ-Int4"
-    assert metadata.model_revision == "64a72a40045ac345005795f703a8ba627e99b48e"
+    assert metadata.display_name == "Seed-X PPO 7B (NF4)"
+    assert metadata.model_id == "ByteDance-Seed/Seed-X-PPO-7B"
+    assert metadata.model_revision == "6ef78fc034ec86c0036d7a7ca2bfc24607f48050"
+    assert metadata.model_path is not None
+    assert metadata.model_path.name == "seed-x-ppo-7b"
     assert metadata.runtime_kind == "isolated_worker"
     assert metadata.required_file_groups == (("model.safetensors",),)
     assert metadata.license_name == "OpenMDW"
-    assert metadata.estimated_vram_bytes == 8 * 1024**3
+    assert metadata.estimated_vram_bytes == 6 * 1024**3
     assert metadata.max_input_tokens == 4_096
-    assert metadata.quantization == "compressed-tensors-awq-int4"
+    assert metadata.quantization == "bitsandbytes-nf4-double"
     assert metadata.default_timeout_seconds == 3_600
-    assert "compressed-tensors==0.18.0" in metadata.worker_requirements
+    assert "bitsandbytes==0.50.0" in metadata.worker_requirements
+    assert all(not requirement.startswith("compressed-tensors==") for requirement in metadata.worker_requirements)
+    assert "tokenizer_config.json" not in metadata.required_files
+    assert all("awq" not in alias for alias in metadata.aliases)
 
 
 @pytest.mark.parametrize(
@@ -206,11 +211,12 @@ def test_registry_rejects_unknown_translator() -> None:
 
 def test_registered_model_forwards_explicit_acquisition_options(tmp_path: Path) -> None:
     selected_path = tmp_path / "selected-model"
-    custom_revision = "abcdef0123456789abcdef0123456789abcdef01"
-    expected = ResolvedLocalModel(selected_path, custom_revision)
+    pinned_revision = get_translator_metadata("translategemma").model_revision
+    assert pinned_revision is not None
+    expected = ResolvedLocalModel(selected_path, pinned_revision)
     options = TranslationOptions(
         model_path=selected_path,
-        model_revision=custom_revision,
+        model_revision=pinned_revision,
         auto_download_model=True,
     )
 
@@ -223,6 +229,24 @@ def test_registered_model_forwards_explicit_acquisition_options(tmp_path: Path) 
     assert result is expected
     call_kwargs = acquire.call_args.kwargs
     assert call_kwargs["model_path"] == selected_path
-    assert call_kwargs["revision"] == custom_revision
+    assert call_kwargs["revision"] == pinned_revision
     assert call_kwargs["auto_download"] is True
     assert call_kwargs["requires_hf_token"] is True
+
+
+@pytest.mark.parametrize("translator_id", ["translategemma-12b", "seedx"])
+def test_registered_model_rejects_foreign_revision_before_acquisition(
+    translator_id: str,
+) -> None:
+    options = TranslationOptions(
+        model_revision="0" * 40,
+        auto_download_model=True,
+    )
+
+    with (
+        patch("sub_translate.utils.huggingface.acquire_local_model") as acquire,
+        pytest.raises(TranslationError, match="закреплённой ревизией"),
+    ):
+        resolve_registered_model(translator_id, options)
+
+    acquire.assert_not_called()
