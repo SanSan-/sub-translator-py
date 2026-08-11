@@ -4,15 +4,13 @@ import asyncio
 import logging
 import queue
 import re
-import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
 import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from sub_translate import __version__
@@ -21,9 +19,13 @@ from sub_translate.service import ProcessingResult, ProcessingSettings, Processi
 from sub_translate.web import __main__ as web_main
 from sub_translate.web import app as web_app
 
+VALID_SRT = "1\n00:00:00,000 --> 00:00:01,000\nТекст\n"
+VALID_VTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nТекст\n"
+
 
 @pytest.fixture(autouse=True)
 def reset_job_registry() -> Iterator[None]:
+    web_app.preparation_registry.reset_for_tests()
     with web_app._jobs_lock:
         web_app._jobs.clear()
     with web_app._active_job_lock:
@@ -33,6 +35,7 @@ def reset_job_registry() -> Iterator[None]:
         web_app._jobs.clear()
     with web_app._active_job_lock:
         web_app._active_job_id = None
+    web_app.preparation_registry.reset_for_tests()
 
 
 @pytest.fixture
@@ -102,8 +105,13 @@ def test_index_health_config_and_openapi(client: TestClient) -> None:
     assert config_response.json()["defaults"]["batch_size"] == 21
     assert schema["info"]["version"] == __version__
     assert "500" in schema["paths"]["/api/pick"]["post"]["responses"]
+    assert {"400", "500"} <= schema["paths"]["/api/refresh"]["post"]["responses"].keys()
+    assert "/api/preparation-status" in schema["paths"]
     assert "409" in schema["paths"]["/api/translate"]["post"]["responses"]
+    assert "503" in schema["paths"]["/api/translate"]["post"]["responses"]
+    assert "404" in schema["paths"]["/api/jobs/{job_id}"]["get"]["responses"]
     assert "404" in schema["paths"]["/api/stream/{job_id}"]["get"]["responses"]
+    assert "409" in schema["paths"]["/api/unload"]["post"]["responses"]
 
 
 def test_ui_config_is_registry_driven_and_contains_no_local_paths() -> None:
@@ -384,25 +392,39 @@ def test_bounded_event_queue_discards_oldest_events_and_preserves_done() -> None
 
 
 @pytest.mark.parametrize(
-    ("candidate", "expected"),
-    [("ru", True), ("rus", True), ("ru-RU", True), ("notes", False), ("", False)],
+    ("name", "expected"),
+    [
+        ("lecture.cc.srt", True),
+        ("movie.web.srt", True),
+        ("lesson.ru.srt", False),
+        ("lesson.en.srt", True),
+    ],
 )
-def test_language_suffix_detection(candidate: str, expected: bool) -> None:
-    assert web_app._is_language_suffix(candidate) is expected
+def test_folder_source_excludes_only_target_language(name: str, expected: bool) -> None:
+    assert web_app._is_folder_source(Path(name), "ru") is expected
 
 
 def test_iter_subtitles_filters_format_source_and_target(tmp_path: Path) -> None:
     expected = tmp_path / "lesson.en.srt"
+    nested = tmp_path / "Вложенная папка"
+    nested.mkdir()
+    nested_expected = nested / "урок с пробелом.en.ASS"
     expected.write_text("1\n", encoding="utf-8")
+    nested_expected.write_text("[Script Info]\n", encoding="utf-8")
     (tmp_path / "plain.vtt").write_text("WEBVTT\n", encoding="utf-8")
     (tmp_path / "lesson.ru.srt").write_text("1\n", encoding="utf-8")
-    (tmp_path / "lesson.ja.ass").write_text("[Script Info]\n", encoding="utf-8")
+    other_language = tmp_path / "lesson.ja.ass"
+    other_language.write_text("[Script Info]\n", encoding="utf-8")
     (tmp_path / "notes.txt").write_text("text", encoding="utf-8")
 
     result = list(web_app._iter_subtitles(tmp_path, "en", "ru"))
 
-    assert result == [expected, tmp_path / "plain.vtt"]
-    assert list(web_app._iter_subtitles(tmp_path / "missing", "en", "ru")) == []
+    assert result == sorted(
+        [nested_expected, expected, other_language, tmp_path / "plain.vtt"],
+        key=lambda path: (str(path).casefold(), str(path)),
+    )
+    with pytest.raises(web_app.PickerError, match="Выбранный каталог"):
+        web_app._iter_subtitles(tmp_path / "missing", "en", "ru")
 
 
 def test_build_items_marks_full_identity_or_existing_output_as_cached(
@@ -411,8 +433,8 @@ def test_build_items_marks_full_identity_or_existing_output_as_cached(
 ) -> None:
     first = tmp_path / "first.srt"
     second = tmp_path / "second.srt"
-    first.write_text("1\n", encoding="utf-8")
-    second.write_text("1\n", encoding="utf-8")
+    first.write_text(VALID_SRT, encoding="utf-8")
+    second.write_text(VALID_SRT, encoding="utf-8")
     outputs = {
         first: tmp_path / "first.ru.srt",
         second: tmp_path / "second.ru.srt",
@@ -450,78 +472,17 @@ def test_build_items_marks_full_identity_or_existing_output_as_cached(
     assert checked_identities == [first]
 
 
-class FakeTkRoot:
-    def __init__(self) -> None:
-        self.destroyed = False
-        self.topmost = False
-
-    def withdraw(self) -> None:
-        return None
-
-    def attributes(self, name: str, value: bool) -> None:
-        assert name == "-topmost"
-        self.topmost = value
-
-    def destroy(self) -> None:
-        self.destroyed = True
-
-
-def install_fake_tk(
-    monkeypatch,
-    *,
-    folder: str = "",
-    files: tuple[str, ...] = (),
-) -> FakeTkRoot:
-    root = FakeTkRoot()
-    module = ModuleType("tkinter")
-    module.Tk = lambda: root
-    module.filedialog = SimpleNamespace(
-        askdirectory=lambda: folder,
-        askopenfilenames=lambda **_kwargs: files,
-    )
-    monkeypatch.setitem(sys.modules, "tkinter", module)
-    return root
-
-
-def test_tk_picker_returns_folder_and_destroys_root(monkeypatch, tmp_path: Path) -> None:
-    root = install_fake_tk(monkeypatch, folder=str(tmp_path))
-
-    result = web_app._pick_with_tk("folder")
-
-    assert result == {"mode": "folder", "path": str(tmp_path)}
-    assert root.topmost is True
-    assert root.destroyed is True
-
-
-def test_tk_picker_returns_files_or_empty_folder(monkeypatch, tmp_path: Path) -> None:
-    subtitle = tmp_path / "episode.srt"
-    install_fake_tk(monkeypatch, files=(str(subtitle),))
-
-    assert web_app._pick_with_tk("file") == {"mode": "files", "paths": [str(subtitle)]}
-
-    install_fake_tk(monkeypatch, folder="")
-    assert web_app._pick_with_tk("folder") == {"mode": "folder", "path": "", "items": []}
-
-
-def test_tk_picker_reports_unavailable_runtime(monkeypatch) -> None:
-    monkeypatch.setitem(sys.modules, "tkinter", None)
-
-    with pytest.raises(HTTPException, match="Не удалось открыть диалог выбора"):
-        web_app._pick_with_tk("file")
-
-
 def test_pick_and_refresh_endpoints(client: TestClient, monkeypatch, tmp_path: Path) -> None:
     subtitle = tmp_path / "episode.srt"
-    other = tmp_path / "notes.txt"
-    subtitle.write_text("1\n", encoding="utf-8")
-    other.write_text("text", encoding="utf-8")
-    item = {"name": subtitle.name, "path": str(subtitle), "format": "srt"}
-    monkeypatch.setattr(
-        web_app,
-        "_pick_with_tk",
-        lambda kind: {"mode": "files", "paths": [str(subtitle), str(other)]},
-    )
-    monkeypatch.setattr(web_app, "_build_items", lambda paths, _settings: [item for _ in paths])
+    subtitle.write_text(VALID_SRT, encoding="utf-8")
+    received: dict[str, object] = {}
+
+    def fake_pick_paths(kind, *, recursive, accept_path, progress_callback):
+        received.update(kind=kind, recursive=recursive, accepted=accept_path(subtitle))
+        progress_callback({"phase": "collecting", "discovered": 1, "total": 1})
+        return web_app.PickSelection(mode="files", paths=(subtitle,))
+
+    monkeypatch.setattr(web_app, "pick_paths", fake_pick_paths)
 
     picked = client.post(
         "/api/pick",
@@ -533,8 +494,17 @@ def test_pick_and_refresh_endpoints(client: TestClient, monkeypatch, tmp_path: P
     )
 
     assert picked.status_code == 200
+    assert picked.json()["path"] == ""
+    assert picked.json()["paths"] == [str(subtitle)]
+    assert picked.json()["cancelled"] is False
+    assert picked.json()["recursive"] is False
     assert len(picked.json()["items"]) == 1
-    assert refreshed.json() == {"items": [item]}
+    assert received == {"kind": "file", "recursive": False, "accepted": True}
+    assert refreshed.status_code == 200
+    assert refreshed.json()["paths"] == [str(subtitle)]
+    assert refreshed.json()["recursive"] is False
+    assert refreshed.json()["items"][0]["name"] == subtitle.name
+    assert client.get("/api/preparation-status").json()["status"] == "done"
 
 
 def test_pick_folder_handles_cancel_and_selected_folder(
@@ -542,27 +512,170 @@ def test_pick_folder_handles_cancel_and_selected_folder(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    captured_settings: list[web_app.TranslationSettings] = []
-    monkeypatch.setattr(web_app, "_pick_with_tk", lambda _kind: {"mode": "folder", "path": ""})
+    subtitle = tmp_path / "episode.srt"
+    subtitle.write_text(VALID_SRT, encoding="utf-8")
+    monkeypatch.setattr(
+        web_app,
+        "pick_paths",
+        lambda *_args, **_kwargs: web_app.PickSelection(mode="folder", paths=()),
+    )
     cancelled = client.post("/api/pick", json={"kind": "folder"})
 
     monkeypatch.setattr(
         web_app,
-        "_pick_with_tk",
-        lambda _kind: {"mode": "folder", "path": str(tmp_path)},
+        "pick_paths",
+        lambda *_args, **_kwargs: web_app.PickSelection(
+            mode="folder",
+            paths=(subtitle,),
+            folder=tmp_path,
+        ),
     )
-    monkeypatch.setattr(web_app, "_iter_subtitles", lambda *_args: [tmp_path / "episode.srt"])
-
-    def build_items(_paths, settings):
-        captured_settings.append(settings)
-        return [{"name": "episode.srt"}]
-
-    monkeypatch.setattr(web_app, "_build_items", build_items)
     selected = client.post("/api/pick", json={"kind": "folder"})
 
-    assert cancelled.json() == {"mode": "folder", "path": "", "items": []}
-    assert selected.json()["items"] == [{"name": "episode.srt"}]
-    assert captured_settings[0].api == web_app.DEFAULT_TRANSLATOR_ID
+    assert cancelled.json() == {
+        "mode": "folder",
+        "path": "",
+        "paths": [],
+        "items": [],
+        "cancelled": True,
+        "recursive": True,
+    }
+    assert selected.status_code == 200
+    assert selected.json()["path"] == str(tmp_path)
+    assert selected.json()["paths"] == [str(subtitle)]
+    assert selected.json()["items"][0]["name"] == "episode.srt"
+    assert selected.json()["recursive"] is True
+
+
+def test_refresh_reexpands_folder_recursively_and_excludes_translated_target(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    nested = tmp_path / "Вложенная папка"
+    nested.mkdir()
+    top = tmp_path / "верх.en.srt"
+    child = nested / "низ с пробелом.en.VTT"
+    translated = nested / "низ с пробелом.google.ru.vtt"
+    top.write_text(VALID_SRT, encoding="utf-8")
+    child.write_text(VALID_VTT, encoding="utf-8")
+    translated.write_text(VALID_VTT, encoding="utf-8")
+
+    response = client.post(
+        "/api/refresh",
+        json={
+            "paths": [str(tmp_path)],
+            "settings": {"api": "google", "source_lang": "en", "target_lang": "ru"},
+            "recursive": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["path"] == str(tmp_path)
+    assert response.json()["recursive"] is True
+    expected = sorted((str(child), str(top)), key=lambda value: (value.casefold(), value))
+    assert response.json()["paths"] == expected
+    assert [item["path"] for item in response.json()["items"]] == expected
+
+
+def test_pick_error_remains_visible_in_preparation_status(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    raw_detail = r"RAW_OS_PRIVATE_DETAIL C:\private\folder"
+    log_exception = Mock()
+
+    def fail_pick(*_args, **_kwargs):
+        try:
+            raise PermissionError(raw_detail)
+        except PermissionError as exc:
+            raise web_app.PickerError("Не удалось прочитать выбранный каталог.") from exc
+
+    monkeypatch.setattr(web_app, "pick_paths", fail_pick)
+    monkeypatch.setattr(web_app._WEB_LOGGER, "exception", log_exception)
+
+    response = client.post("/api/pick", json={"kind": "folder"})
+    status = client.get("/api/preparation-status").json()
+
+    assert response.status_code == 500
+    assert status["status"] == "error"
+    assert status["active"] is False
+    assert "Не удалось прочитать" in status["error"]
+    assert raw_detail not in response.text
+    assert "Traceback" not in response.text
+    log_exception.assert_called_once_with("Системный выбор субтитров завершился ошибкой.")
+
+
+def test_file_pick_keeps_valid_neighbor_and_returns_safe_error_cards(
+    client: TestClient,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    valid = tmp_path / "01-valid.srt"
+    missing = tmp_path / "02-missing.srt"
+    malformed = tmp_path / "03-malformed.vtt"
+    valid.write_text(VALID_SRT, encoding="utf-8")
+    malformed.write_text("WEBVTT\n", encoding="utf-8")
+    monkeypatch.setattr(
+        web_app,
+        "pick_paths",
+        lambda *_args, **_kwargs: web_app.PickSelection(
+            mode="files",
+            paths=(valid, missing, malformed),
+        ),
+    )
+
+    response = client.post("/api/pick", json={"kind": "file", "settings": {"api": "google"}})
+    by_name = {item["name"]: item for item in response.json()["items"]}
+
+    assert response.status_code == 200
+    assert "state" not in by_name[valid.name]
+    assert by_name[missing.name]["state"] == "error"
+    assert by_name[missing.name]["error"] == "Файл не найден или был перемещён."
+    assert "output" not in by_name[missing.name]
+    assert by_name[malformed.name]["state"] == "error"
+    assert "не соответствует формату VTT" in by_name[malformed.name]["error"]
+    assert "output" not in by_name[malformed.name]
+    assert "Traceback" not in response.text
+    assert client.get("/api/preparation-status").json()["status"] == "done"
+
+
+def test_refresh_isolates_permission_error_without_exposing_raw_os_message(
+    client: TestClient,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    valid = tmp_path / "01-valid.srt"
+    blocked = tmp_path / "02-blocked.srt"
+    valid.write_text(VALID_SRT, encoding="utf-8")
+    blocked.write_text(VALID_SRT, encoding="utf-8")
+    real_read_text = web_app.read_text
+    log_exception = Mock()
+
+    def selective_read(path: Path) -> str:
+        if path == blocked:
+            raise PermissionError("RAW_OS_PRIVATE_DETAIL")
+        return real_read_text(path)
+
+    monkeypatch.setattr(web_app, "read_text", selective_read)
+    monkeypatch.setattr(web_app._WEB_LOGGER, "exception", log_exception)
+
+    response = client.post(
+        "/api/refresh",
+        json={"paths": [str(valid), str(blocked)], "settings": {"api": "google"}},
+    )
+    by_name = {item["name"]: item for item in response.json()["items"]}
+
+    assert response.status_code == 200
+    assert "state" not in by_name[valid.name]
+    assert by_name[blocked.name]["error"] == "Нет доступа к файлу."
+    assert "output" not in by_name[blocked.name]
+    assert "RAW_OS_PRIVATE_DETAIL" not in response.text
+    assert "Traceback" not in response.text
+    log_exception.assert_called_once_with(
+        "Не удалось подготовить файл %s (%s).",
+        blocked,
+        "PermissionError",
+    )
 
 
 def test_apply_agent_prompts_uses_inline_values(monkeypatch) -> None:
@@ -704,6 +817,34 @@ def test_run_job_reports_partial_result_and_cleans_handlers(monkeypatch, tmp_pat
     apply_agent_prompts.assert_not_called()
 
 
+def test_finish_job_downgrades_ok_when_some_files_are_unresolved() -> None:
+    paths = [Path("done.srt"), Path("failed.srt"), Path("started.srt")]
+    job = make_job(paths=paths)
+    job.file_states[str(paths[0])] = {
+        "state": "done",
+        "progress": 100,
+        "output": "done.ru.srt",
+    }
+    job.file_states[str(paths[1])] = {
+        "state": "error",
+        "progress": 100,
+        "error": "Исходная ошибка.",
+    }
+    job.file_states[str(paths[2])] = {"state": "started", "progress": 40}
+
+    web_app._finish_job(job, "ok")
+
+    assert job.status == "partial"
+    assert job.file_states[str(paths[0])]["state"] == "done"
+    assert job.file_states[str(paths[0])]["output"] == "done.ru.srt"
+    assert job.file_states[str(paths[1])]["error"] == "Исходная ошибка."
+    assert job.file_states[str(paths[2])] == {
+        "state": "error",
+        "progress": 100,
+        "error": "Файл не был обработан до завершения задачи.",
+    }
+
+
 @pytest.mark.parametrize("api", ["google", "nllb-600m", "translategemma", "translategemma-12b", "seedx"])
 def test_run_job_ignores_stale_agent_settings_for_non_agent_profiles(
     api: str,
@@ -724,7 +865,18 @@ def test_run_job_ignores_stale_agent_settings_for_non_agent_profiles(
     read_prompt_file = Mock(side_effect=AssertionError("agent files must be ignored"))
     attach_agent_log = Mock()
     detach_agent_log = Mock()
-    process_batch = Mock(return_value=[])
+
+    def successful_batch(input_paths, _settings, **kwargs):
+        path = input_paths[0]
+        result = ProcessingResult(
+            path,
+            path.with_suffix(".ru.srt"),
+            ProcessingStatus.TRANSLATED,
+        )
+        kwargs["result_callback"](result, 1, 1)
+        return [result]
+
+    process_batch = Mock(side_effect=successful_batch)
     monkeypatch.setattr(web_app, "_get_logger", lambda *_args, **_kwargs: logger)
     monkeypatch.setattr(web_app, "_apply_agent_prompts", apply_agent_prompts)
     monkeypatch.setattr(web_app, "read_text", read_prompt_file)
@@ -746,6 +898,22 @@ def test_run_job_ignores_stale_agent_settings_for_non_agent_profiles(
     detach_agent_log.assert_not_called()
 
 
+def test_run_job_empty_result_is_terminal_error(monkeypatch) -> None:
+    paths = [Path("first.srt"), Path("second.srt")]
+    job = make_job(paths=paths)
+    logger = isolated_logger("test_run_job_empty_result_is_terminal_error")
+    monkeypatch.setattr(web_app, "_get_logger", lambda *_args, **_kwargs: logger)
+    monkeypatch.setattr(web_app, "process_subtitle_batch", Mock(return_value=[]))
+
+    web_app._run_job(job)
+
+    assert job.completed is True
+    assert job.status == "error"
+    assert drain_events(job)[-1] == {"type": "done", "status": "error"}
+    assert {state["state"] for state in job.file_states.values()} == {"error"}
+    assert set(job.file_states) == {str(path) for path in paths}
+
+
 def test_run_job_reports_prompt_error(monkeypatch) -> None:
     job = make_job(settings=web_app.TranslationSettings(api="agent"))
     logger = isolated_logger("test_run_job_reports_prompt_error")
@@ -759,6 +927,62 @@ def test_run_job_reports_prompt_error(monkeypatch) -> None:
 
     assert drain_events(job)[-1] == {"type": "done", "status": "error"}
     assert job.completed is True
+
+
+@pytest.mark.parametrize("failure_site", ["logger", "handler"])
+def test_run_job_setup_failure_is_terminal_and_cleans_active_job(
+    client: TestClient,
+    monkeypatch,
+    failure_site: str,
+) -> None:
+    raw_error = "RAW_DISK_FULL_PRIVATE_PATH"
+    web_exception = Mock()
+    logger = isolated_logger(f"test_run_job_setup_failure.{failure_site}")
+    monkeypatch.setattr(web_app._WEB_LOGGER, "exception", web_exception)
+    if failure_site == "logger":
+        monkeypatch.setattr(
+            web_app,
+            "_get_logger",
+            Mock(side_effect=OSError(raw_error)),
+        )
+    else:
+        monkeypatch.setattr(web_app, "_get_logger", lambda *_args, **_kwargs: logger)
+        real_add_handler = logger.addHandler
+        failure_pending = True
+
+        def add_handler_then_fail(handler: logging.Handler) -> None:
+            nonlocal failure_pending
+            real_add_handler(handler)
+            if failure_pending:
+                failure_pending = False
+                raise OSError(raw_error)
+
+        monkeypatch.setattr(logger, "addHandler", add_handler_then_fail)
+
+    response = client.post(
+        "/api/translate",
+        json={"paths": ["episode.srt"], "settings": {"api": "google"}},
+    )
+
+    assert response.status_code == 200
+    job = web_app._get_job(response.json()["job_id"])
+    assert job is not None
+    assert job.thread is not None
+    job.thread.join(timeout=2)
+    assert job.thread.is_alive() is False
+    assert job.completed is True
+    assert job.completed_at is not None
+    assert drain_events(job)[-1] == {"type": "done", "status": "error"}
+    assert web_app._active_job_id is None
+    assert raw_error not in response.text
+    assert "Traceback" not in response.text
+    assert logger.handlers == []
+    snapshot = client.get(f"/api/jobs/{job.job_id}").json()
+    assert snapshot["completed"] is True
+    assert snapshot["status"] == "error"
+    assert snapshot["done"] == 1
+    assert snapshot["items"][0]["state"] == "error"
+    web_exception.assert_called()
 
 
 def test_warnings_capture_restores_logger() -> None:
@@ -777,6 +1001,33 @@ def test_warnings_capture_restores_logger() -> None:
     assert web_app._start_warnings_capture(False, handler) is None
 
 
+def test_warnings_capture_setup_failure_restores_logger(monkeypatch) -> None:
+    handler = web_app.QueueLogHandler(queue.Queue())
+    warnings_logger = logging.getLogger("py.warnings")
+    original_level = warnings_logger.level
+    original_propagate = warnings_logger.propagate
+    original_filters = web_app.warnings.filters[:]
+    real_add_handler = warnings_logger.addHandler
+    failure_pending = True
+
+    def add_handler_then_fail(candidate: logging.Handler) -> None:
+        nonlocal failure_pending
+        real_add_handler(candidate)
+        if failure_pending:
+            failure_pending = False
+            raise OSError("RAW_WARNINGS_HANDLER_PRIVATE_DETAIL")
+
+    monkeypatch.setattr(warnings_logger, "addHandler", add_handler_then_fail)
+
+    with pytest.raises(OSError, match="RAW_WARNINGS_HANDLER_PRIVATE_DETAIL"):
+        web_app._start_warnings_capture(True, handler)
+
+    assert handler not in warnings_logger.handlers
+    assert warnings_logger.level == original_level
+    assert warnings_logger.propagate == original_propagate
+    assert web_app.warnings.filters == original_filters
+
+
 class FakeThread:
     def __init__(self, *, target, args, name: str, daemon: bool) -> None:
         self.target = target
@@ -787,6 +1038,11 @@ class FakeThread:
 
     def start(self) -> None:
         self.started = True
+
+
+class FailingStartThread(FakeThread):
+    def start(self) -> None:
+        raise OSError("RAW_THREAD_START_PRIVATE_DETAIL")
 
 
 @pytest.mark.parametrize("settings", [{}, {"api": None}, {"api": ""}, {"api": "   "}])
@@ -826,6 +1082,121 @@ def test_translate_endpoint_starts_one_filtered_job(client: TestClient, monkeypa
     assert isinstance(job.events, web_app.BoundedEventQueue)
     assert job.events.maxsize == web_app.MAX_EVENTS_PER_JOB
     assert web_app._active_job_id == job_id
+
+
+def test_translate_thread_start_failure_rolls_back_registry(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    web_exception = Mock()
+    monkeypatch.setattr(web_app.threading, "Thread", FailingStartThread)
+    monkeypatch.setattr(web_app._WEB_LOGGER, "exception", web_exception)
+
+    response = client.post(
+        "/api/translate",
+        json={"paths": ["episode.srt"], "settings": {"api": "google"}},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Не удалось запустить задачу перевода."}
+    assert "RAW_THREAD_START_PRIVATE_DETAIL" not in response.text
+    assert "Traceback" not in response.text
+    assert web_app._active_job_id is None
+    with web_app._jobs_lock:
+        assert web_app._jobs == {}
+    web_exception.assert_called_once()
+
+
+def test_translate_rejects_active_preparation_without_creating_job(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(web_app.threading, "Thread", FakeThread)
+    operation_id = web_app.preparation_registry.begin(
+        "pick",
+        phase="collecting",
+        message="Идёт подготовка.",
+    )
+    try:
+        response = client.post(
+            "/api/translate",
+            json={"paths": ["episode.srt"], "settings": {"api": "google"}},
+        )
+    finally:
+        web_app.preparation_registry.finish(operation_id, message="Подготовка завершена.")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": web_app._PREPARATION_IN_PROGRESS_ERROR}
+    assert web_app._active_job_id is None
+    with web_app._jobs_lock:
+        assert web_app._jobs == {}
+
+
+def test_translate_rejects_occupied_picker_lock_without_waiting(
+    client: TestClient,
+) -> None:
+    response_holder: list[httpx.Response] = []
+    acquired = web_app._picker_refresh_lock.acquire(blocking=False)
+    assert acquired is True
+
+    worker = threading.Thread(
+        target=lambda: response_holder.append(
+            client.post(
+                "/api/translate",
+                json={"paths": ["episode.srt"], "settings": {"api": "google"}},
+            )
+        ),
+    )
+    try:
+        worker.start()
+        worker.join(timeout=1)
+        completed_while_locked = not worker.is_alive()
+    finally:
+        web_app._picker_refresh_lock.release()
+        worker.join(timeout=2)
+
+    assert completed_while_locked is True
+    assert response_holder[0].status_code == 409
+    assert response_holder[0].json() == {"detail": web_app._PREPARATION_IN_PROGRESS_ERROR}
+    assert web_app._active_job_id is None
+
+
+def test_translate_rejects_concurrent_folder_pick(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    pick_entered = threading.Event()
+    release_pick = threading.Event()
+    pick_responses: list[httpx.Response] = []
+
+    def blocking_pick(*_args, **_kwargs) -> web_app.PickSelection:
+        pick_entered.set()
+        assert release_pick.wait(timeout=2)
+        return web_app.PickSelection(mode="folder", paths=())
+
+    monkeypatch.setattr(web_app, "pick_paths", blocking_pick)
+    worker = threading.Thread(
+        target=lambda: pick_responses.append(
+            client.post("/api/pick", json={"kind": "folder"}),
+        ),
+    )
+    worker.start()
+    assert pick_entered.wait(timeout=1)
+
+    started_at = web_app.time.monotonic()
+    translate_response = client.post(
+        "/api/translate",
+        json={"paths": ["episode.srt"], "settings": {"api": "google"}},
+    )
+    elapsed = web_app.time.monotonic() - started_at
+    release_pick.set()
+    worker.join(timeout=2)
+
+    assert worker.is_alive() is False
+    assert pick_responses[0].status_code == 200
+    assert translate_response.status_code == 409
+    assert elapsed < 1
+    assert web_app._active_job_id is None
 
 
 def test_translate_creation_prunes_oldest_terminal_job_at_limit_plus_one(
@@ -914,7 +1285,7 @@ def test_active_job_returns_snapshot(client: TestClient, monkeypatch) -> None:
     monkeypatch.setattr(
         web_app,
         "_build_items",
-        lambda *_args: [{"path": "one.srt"}, {"path": "two.srt"}],
+        Mock(side_effect=AssertionError("snapshot must not build items")),
     )
 
     snapshot = client.get("/api/active-job").json()
@@ -923,6 +1294,111 @@ def test_active_job_returns_snapshot(client: TestClient, monkeypatch) -> None:
     assert snapshot["done"] == 1
     assert snapshot["logs"] == ["строка"]
     assert snapshot["items"][0]["state"] == "done"
+    assert snapshot["items"][1]["state"] == "queued"
+
+
+def test_repeated_large_job_snapshots_use_only_memory(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    paths = [Path(f"folder-{index // 100}/subtitle-{index:05d}.srt") for index in range(10_000)]
+    job = make_job(paths=paths)
+    with web_app._jobs_lock:
+        web_app._jobs[job.job_id] = job
+    with web_app._active_job_lock:
+        web_app._active_job_id = job.job_id
+    build_items = Mock(side_effect=AssertionError("snapshot must not build items"))
+    read_source = Mock(side_effect=AssertionError("snapshot must not read files"))
+    monkeypatch.setattr(web_app, "_build_items", build_items)
+    monkeypatch.setattr(web_app, "read_text", read_source)
+
+    active = client.get("/api/active-job")
+    first = client.get(f"/api/jobs/{job.job_id}")
+    second = client.get(f"/api/jobs/{job.job_id}")
+
+    assert active.status_code == 200
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(first.json()["items"]) == 10_000
+    assert first.json()["items"][0] == {
+        "name": "subtitle-00000.srt",
+        "path": str(paths[0]),
+        "format": "srt",
+        "state": "queued",
+        "progress": 0,
+    }
+    assert second.json()["done"] == 0
+    build_items.assert_not_called()
+    read_source.assert_not_called()
+
+
+def test_active_job_keeps_recorded_state_when_source_disappears(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "исчезнувший.srt"
+    output = tmp_path / "исчезнувший.google.ru.srt"
+    job = make_job(paths=[missing])
+    job.job_total = 1
+    job.file_states[str(missing)] = {
+        "state": "done",
+        "progress": 100,
+        "output": str(output),
+    }
+    with web_app._jobs_lock:
+        web_app._jobs[job.job_id] = job
+    with web_app._active_job_lock:
+        web_app._active_job_id = job.job_id
+
+    snapshot = client.get("/api/active-job").json()
+    item = snapshot["items"][0]
+
+    assert snapshot["done"] == 1
+    assert item["state"] == "done"
+    assert item["output"] == str(output)
+    assert "error" not in item
+
+
+def test_completed_job_snapshot_survives_consumed_terminal_event(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "первый файл.srt"
+    second = tmp_path / "второй файл.srt"
+    first.write_text(VALID_SRT, encoding="utf-8")
+    second.write_text(VALID_SRT, encoding="utf-8")
+    job = make_job(paths=[first, second])
+    with web_app._jobs_lock:
+        web_app._jobs[job.job_id] = job
+    with web_app._active_job_lock:
+        web_app._active_job_id = job.job_id
+    web_app._emit_job_event(job, {"type": "job", "total": 2})
+    web_app._emit_job_event(job, {"type": "log", "message": "Файл 1 готов."})
+    web_app._emit_file_state(job, first, 1, 2, "done", 100, output=first.with_suffix(".ru.srt"))
+    web_app._emit_file_state(job, second, 2, 2, "error", 100, error="Ошибка перевода.")
+    web_app._finish_job(job, "partial")
+    drain_events(job)
+
+    response = client.get(f"/api/jobs/{job.job_id}")
+
+    assert response.status_code == 200
+    snapshot = response.json()
+    assert snapshot["job_id"] == job.job_id
+    assert snapshot["completed"] is True
+    assert snapshot["status"] == "partial"
+    assert snapshot["logs"] == ["Файл 1 готов."]
+    assert snapshot["total"] == 2
+    assert snapshot["done"] == 2
+    assert [item["state"] for item in snapshot["items"]] == ["done", "error"]
+    assert web_app._active_job_id is None
+
+
+def test_job_snapshot_returns_safe_404_for_unknown_job(client: TestClient) -> None:
+    response = client.get("/api/jobs/RAW_UNKNOWN_PRIVATE_JOB")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Задача не найдена."}
+    assert "RAW_UNKNOWN_PRIVATE_JOB" not in response.text
 
 
 def test_unload_endpoint_uses_shared_local_lifecycle(client: TestClient, monkeypatch) -> None:
@@ -933,6 +1409,19 @@ def test_unload_endpoint_uses_shared_local_lifecycle(client: TestClient, monkeyp
 
     assert response.json() == {"status": "ok", "message": "Модели выгружены."}
     unload.assert_called_once_with()
+
+
+def test_unload_endpoint_rejects_active_job(client: TestClient, monkeypatch) -> None:
+    unload = Mock()
+    monkeypatch.setattr(web_app, "unload_all_local_translators", unload)
+    with web_app._active_job_lock:
+        web_app._active_job_id = "busy"
+
+    response = client.post("/api/unload", json={})
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Перевод уже выполняется."}
+    unload.assert_not_called()
 
 
 def test_unload_endpoint_returns_safe_error(client: TestClient, monkeypatch) -> None:
@@ -977,3 +1466,19 @@ def test_stream_returns_keepalive_and_done_event(client: TestClient) -> None:
     assert response.headers["content-type"].startswith("text/event-stream")
     assert ": keep-alive" in response.text
     assert 'data: {"type": "done", "status": "ok"}' in response.text
+
+
+def test_two_stream_consumers_receive_terminal_event(client: TestClient) -> None:
+    job = make_job()
+    with web_app._jobs_lock:
+        web_app._jobs[job.job_id] = job
+    web_app._finish_job(job, "error")
+
+    first = client.get(f"/api/stream/{job.job_id}")
+    second = client.get(f"/api/stream/{job.job_id}")
+
+    expected = 'data: {"type": "done", "status": "error"}'
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert expected in first.text
+    assert expected in second.text

@@ -14,15 +14,18 @@
         <div class="brand-sub">Локальный и облачный перевод субтитров</div>
       </div>
       <div class="actions">
-        <div id="picker" class="picker">
+        <div id="picker" class="picker" aria-busy="false">
           <div class="picker-icon" aria-hidden="true">⬈</div>
           <div class="picker-text">Выбор файла/папки</div>
-          <div class="picker-hint">Нажмите, чтобы выбрать файл или папку</div>
+          <output id="pickerHint" class="picker-hint" aria-live="polite">
+            ASS, SRT и VTT; папка включает все подпапки
+          </output>
           <div class="picker-actions">
             <button id="pickerFileBtn" class="btn ghost" type="button">Файл</button>
             <button id="pickerFolderBtn" class="btn ghost" type="button">Папка</button>
           </div>
         </div>
+        <button id="refreshBtn" class="btn ghost" type="button" disabled>Обновить</button>
         <button id="unloadBtn" class="btn ghost" type="button" title="Выгрузить модели из памяти">🗑️ Выгрузить</button>
         <button id="translateBtn" class="btn primary" type="button" disabled>Перевести</button>
       </div>

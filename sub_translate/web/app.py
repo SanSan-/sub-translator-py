@@ -4,12 +4,11 @@ import json
 import logging
 import os
 import queue
-import re
 import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from ipaddress import ip_address
@@ -65,23 +64,37 @@ from sub_translate.translators.registry import (
     unload_all_local_translators,
 )
 from sub_translate.utils.env_utils import load_env
-from sub_translate.utils.io_utils import read_text
+from sub_translate.utils.io_utils import read_text, split_lines
 from sub_translate.utils.logging_utils import configure_rotating_logger
 from sub_translate.utils.path_utils import split_lang_suffix
-from sub_translate.utils.subtitle_cache import has_cached_output, prompt_signature
+from sub_translate.utils.subtitle_cache import has_cached_output, prompt_signature, validate_cached_lines
+from sub_translate.web.picker import (
+    SUBTITLE_EXTENSIONS,
+    PickerError,
+    PickSelection,
+    collect_subtitle_paths,
+    filter_subtitle_paths,
+    pick_paths,
+)
+from sub_translate.web.preparation import PreparationTracker
 
 ROOT_DIR = Path(__file__).resolve().parent
 STATIC_DIR = ROOT_DIR / "static"
 load_env()
 
-SUBTITLE_EXTS = {".ass", ".srt", ".vtt"}
-_LANG_SUFFIX_PATTERN = re.compile(r"^[a-z]{2,3}(?:[-_][a-z0-9]+)*$")
+SUBTITLE_EXTS = SUBTITLE_EXTENSIONS
 _MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _TEST_CLIENT_HOST = "testclient"
 _TEST_CLIENT_EXTENSION = "http.response.debug"
 _LOCAL_ACCESS_ERROR = "Доступ разрешён только через локальный интерфейс."
 _ORIGIN_ACCESS_ERROR = "Источник запроса не совпадает с локальным интерфейсом."
 _REQUEST_VALIDATION_ERROR = "Запрос не прошёл проверку."
+_PREPARATION_IN_PROGRESS_ERROR = "Подготовка файлов уже выполняется."
+
+
+class _SubtitlePreparationError(ValueError):
+    """Безопасная ошибка подготовки одной карточки файла."""
+
 
 MAX_STORED_JOBS = 32
 MAX_EVENTS_PER_JOB = 512
@@ -252,6 +265,7 @@ class PickRequest(StrictRequestModel):
 class RefreshRequest(StrictRequestModel):
     paths: list[str]
     settings: TranslationSettings
+    recursive: bool = False
 
 
 class TranslateRequest(StrictRequestModel):
@@ -324,6 +338,7 @@ class TranslationJob:
     settings: TranslationSettings
     events: queue.Queue[dict[str, Any]]
     thread: threading.Thread | None
+    status: str = "running"
     completed: bool = False
     job_total: int = 0
     file_states: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -338,8 +353,11 @@ _jobs: dict[str, TranslationJob] = {}
 _jobs_lock = threading.Lock()
 _active_job_id: str | None = None
 _active_job_lock = threading.Lock()
+preparation_registry = PreparationTracker()
+_picker_refresh_lock = threading.Lock()
 
 LOG_HISTORY_LIMIT = 250
+_TERMINAL_FILE_STATES = frozenset({"cached", "done", "error"})
 
 
 def _terminal_timestamp(job: TranslationJob) -> float | None:
@@ -442,23 +460,61 @@ def active_job() -> dict[str, Any]:
     job = _get_job(job_id)
     if job is None:
         return {"active": False}
-    items = _build_items(job.paths, job.settings)
+    return {"active": True, **_build_job_snapshot(job)}
+
+
+def _build_job_snapshot(job: TranslationJob) -> dict[str, Any]:
     with job.lock:
-        for item in items:
-            state = job.file_states.get(item["path"])
-            if state:
-                item.update(state)
+        paths = list(job.paths)
+        file_states = {path: dict(state) for path, state in job.file_states.items()}
         logs = list(job.log_lines)
-        total = job.job_total or len(items)
+        total = job.job_total or len(paths)
+        completed = job.completed
+        status = job.status
+    items = [_build_snapshot_item(path, file_states.get(str(path), {})) for path in paths]
     done = sum(1 for item in items if item.get("state") in {"cached", "done", "error"})
     return {
-        "active": True,
-        "job_id": job_id,
+        "job_id": job.job_id,
+        "completed": completed,
+        "status": status,
         "items": items,
         "logs": logs,
         "total": total,
         "done": done,
     }
+
+
+def _build_snapshot_item(path: Path, state: Mapping[str, Any]) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "name": path.name,
+        "path": str(path),
+        "format": path.suffix.casefold().lstrip("."),
+        "state": state.get("state", "queued"),
+        "progress": state.get("progress", 0),
+    }
+    for key in ("output", "error"):
+        if key in state:
+            item[key] = state[key]
+    if state.get("state") == "cached":
+        item["cached"] = True
+    return item
+
+
+@app.get(
+    "/api/jobs/{job_id}",
+    responses={404: {"description": "Задача не найдена."}},
+)
+def job_snapshot(job_id: str) -> dict[str, Any]:
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена.")
+    return _build_job_snapshot(job)
+
+
+@app.get("/api/preparation-status")
+def preparation_status() -> dict[str, Any]:
+    """Возвращает ход выбора и рекурсивного обхода каталога."""
+    return preparation_registry.snapshot()
 
 
 def _build_language_options(include_auto: bool) -> list[dict[str, str]]:
@@ -599,108 +655,208 @@ def _has_target_suffix(path: Path, target_lang: str) -> bool:
     return candidate == resolved_target
 
 
-def _is_language_suffix(candidate: str) -> bool:
-    if not candidate:
-        return False
-    normalized = candidate.lower()
-    if get_code(normalized):
-        return True
-    return bool(_LANG_SUFFIX_PATTERN.fullmatch(normalized))
+def _is_folder_source(path: Path, target_lang: str) -> bool:
+    return _is_subtitle(path) and not _has_target_suffix(path, target_lang)
 
 
-def _matches_source_suffix(path: Path, source_lang: str) -> bool:
-    if not source_lang:
-        return True
-    resolved_source = (get_code(source_lang) or source_lang).lower()
-    if not resolved_source:
-        return True
-    stem = path.stem
-    if "." not in stem:
-        return True
-    candidate = stem.rsplit(".", 1)[1].lower()
-    if not _is_language_suffix(candidate):
-        return True
-    return candidate == resolved_source
+def _iter_subtitles(
+    folder: Path,
+    _source_lang: str,
+    target_lang: str,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[Path, ...]:
+    return collect_subtitle_paths(
+        folder,
+        recursive=True,
+        accept_path=lambda path: _is_folder_source(path, target_lang),
+        progress_callback=progress_callback,
+    )
 
 
-def _iter_subtitles(folder: Path, source_lang: str, target_lang: str) -> Iterable[Path]:
-    if not folder.exists():
-        return []
-    results = []
-    for item in sorted(folder.iterdir()):
-        if not item.is_file() or not _is_subtitle(item):
-            continue
-        if not _matches_source_suffix(item, source_lang):
-            continue
-        if _has_target_suffix(item, target_lang):
-            continue
-        results.append(item)
-    return results
-
-
-def _build_items(paths: Iterable[Path], settings: TranslationSettings) -> list[dict[str, Any]]:
+def _build_items(
+    paths: Iterable[Path],
+    settings: TranslationSettings,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
     processing = _to_processing_settings(settings)
     api = processing.api
+    selected_paths = list(paths)
+    total = len(selected_paths)
     items: list[dict[str, Any]] = []
-    for path in paths:
-        file_format = resolve_format(path, None)
-        source_lang, output_path = resolve_io_paths(
-            path,
-            None,
-            processing.source_lang,
-            processing.target_lang,
-            api,
-            file_format,
-        )
-        cached = output_path.exists()
-        if not cached:
-            try:
-                identity = build_output_cache_identity(
-                    path,
-                    file_format,
-                    processing,
-                    source_lang=source_lang,
-                )
-                cached = has_cached_output(identity, _WEB_LOGGER)
-            except OSError, ValueError:
-                cached = False
-        items.append(
-            {
-                "name": path.name,
-                "path": str(path),
-                "format": file_format.value,
-                "cached": cached,
-                "output": str(output_path),
-            }
-        )
+    for index, path in enumerate(selected_paths, start=1):
+        try:
+            items.append(_build_item(path, processing, api))
+        except Exception as exc:
+            _WEB_LOGGER.exception(
+                "Не удалось подготовить файл %s (%s).",
+                path,
+                type(exc).__name__,
+            )
+            items.append(_build_error_item(path, exc))
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "queueing",
+                    "discovered": total,
+                    "processed": index,
+                    "total": total,
+                }
+            )
     return items
 
 
-def _pick_with_tk(kind: str) -> dict[str, Any]:
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception as exc:  # pragma: no cover - зависит от окружения
-        raise HTTPException(status_code=500, detail=f"Не удалось открыть диалог выбора: {exc}") from exc
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    try:
-        if kind == "folder":
-            path = filedialog.askdirectory()
-            if not path:
-                return {"mode": "folder", "path": "", "items": []}
-            return {"mode": "folder", "path": path}
-        paths = filedialog.askopenfilenames(
-            filetypes=[
-                ("Субтитры", "*.ass *.srt *.vtt"),
-                ("Все файлы", "*.*"),
-            ]
+def _build_item(
+    path: Path,
+    processing: ProcessingSettings,
+    api: str,
+) -> dict[str, Any]:
+    file_format = resolve_format(path, None)
+    lines = split_lines(read_text(path))
+    if not validate_cached_lines(lines, file_format):
+        raise _SubtitlePreparationError(
+            f"Содержимое не соответствует формату {file_format.value.upper()}.",
         )
-        return {"mode": "files", "paths": list(paths)}
-    finally:
-        root.destroy()
+    source_lang, output_path = resolve_io_paths(
+        path,
+        None,
+        processing.source_lang,
+        processing.target_lang,
+        api,
+        file_format,
+    )
+    cached = output_path.exists()
+    if not cached:
+        try:
+            identity = build_output_cache_identity(
+                path,
+                file_format,
+                processing,
+                source_lang=source_lang,
+            )
+            cached = has_cached_output(identity, _WEB_LOGGER)
+        except OSError, ValueError:
+            path.stat()
+            cached = False
+    return {
+        "name": path.name,
+        "path": str(path),
+        "format": file_format.value,
+        "cached": cached,
+        "output": str(output_path),
+    }
+
+
+def _build_error_item(path: Path, error: Exception) -> dict[str, Any]:
+    if isinstance(error, FileNotFoundError):
+        message = "Файл не найден или был перемещён."
+    elif isinstance(error, PermissionError):
+        message = "Нет доступа к файлу."
+    elif isinstance(error, UnicodeError):
+        message = "Файл не является корректным UTF-8."
+    elif isinstance(error, _SubtitlePreparationError):
+        message = str(error) or "Содержимое субтитров повреждено."
+    elif isinstance(error, ValueError):
+        message = "Не удалось проверить параметры файла."
+    else:
+        message = f"Не удалось подготовить файл ({type(error).__name__})."
+    return {
+        "name": path.name,
+        "path": str(path),
+        "format": path.suffix.casefold().lstrip("."),
+        "cached": False,
+        "state": "error",
+        "progress": 100,
+        "error": message,
+    }
+
+
+def _begin_preparation(operation: str, *, phase: str, message: str) -> str:
+    operation_id = preparation_registry.begin(operation, phase=phase, message=message)
+    _WEB_LOGGER.info(message)
+    return operation_id
+
+
+def _update_preparation(operation_id: str, event: Mapping[str, Any]) -> None:
+    message_value = event.get("message")
+    message = str(message_value) if message_value else None
+    preparation_registry.update(
+        operation_id,
+        phase=str(event["phase"]) if event.get("phase") else None,
+        discovered=_optional_int(event.get("discovered")),
+        processed=_optional_int(event.get("processed")),
+        total=_optional_int(event.get("total")),
+        message=message,
+    )
+    if message:
+        _WEB_LOGGER.info(message)
+
+
+def _finish_preparation(operation_id: str, message: str) -> None:
+    preparation_registry.finish(operation_id, message=message)
+    _WEB_LOGGER.info(message)
+
+
+def _fail_preparation(operation_id: str, error: object) -> None:
+    message = str(error) or error.__class__.__name__
+    preparation_registry.fail(operation_id, message=message)
+    _WEB_LOGGER.error("Подготовка субтитров завершилась ошибкой: %s", message)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except TypeError, ValueError:
+        return None
+
+
+def _selection_payload(
+    selection: PickSelection,
+    items: list[dict[str, Any]],
+    *,
+    recursive: bool,
+) -> dict[str, Any]:
+    return {
+        "mode": selection.mode,
+        "path": str(selection.folder) if selection.folder else "",
+        "paths": [str(path) for path in selection.paths],
+        "items": items,
+        "cancelled": selection.folder is None and not selection.paths,
+        "recursive": recursive,
+    }
+
+
+def _normalize_refresh_path(value: str) -> Path:
+    return Path(os.path.abspath(Path(value).expanduser()))
+
+
+def _expand_refresh_paths(
+    payload: RefreshRequest,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+) -> tuple[tuple[Path, ...], Path | None, bool]:
+    source_paths = [_normalize_refresh_path(value) for value in payload.paths]
+    candidates: list[Path] = []
+    folders: list[Path] = []
+    for path in source_paths:
+        if path.is_dir() or (payload.recursive and not _is_subtitle(path)):
+            folders.append(path)
+            candidates.extend(
+                _iter_subtitles(
+                    path,
+                    payload.settings.source_lang,
+                    payload.settings.target_lang,
+                    progress_callback=progress_callback,
+                )
+            )
+        else:
+            candidates.append(path)
+    paths = filter_subtitle_paths(candidates)
+    folder = folders[0] if len(source_paths) == 1 and len(folders) == 1 else None
+    return paths, folder, bool(folders) or payload.recursive
 
 
 @app.post(
@@ -709,23 +865,85 @@ def _pick_with_tk(kind: str) -> dict[str, Any]:
 )
 def pick(payload: PickRequest) -> dict[str, Any]:
     settings = payload.settings or TranslationSettings(api=DEFAULT_TRANSLATOR_ID)
-    result = _pick_with_tk(payload.kind)
-    if result.get("mode") == "folder":
-        path_value = result.get("path") or ""
-        if not path_value:
-            return {"mode": "folder", "path": "", "items": []}
-        folder = Path(path_value)
-        items = _build_items(_iter_subtitles(folder, settings.source_lang, settings.target_lang), settings)
-        return {"mode": "folder", "path": str(folder), "items": items}
-    paths = [Path(value) for value in result.get("paths", [])]
-    items = _build_items([path for path in paths if _is_subtitle(path)], settings)
-    return {"mode": "files", "items": items}
+    recursive = payload.kind == "folder"
+    with _picker_refresh_lock:
+        operation_id = _begin_preparation(
+            "pick",
+            phase="dialog",
+            message="Начат выбор локальных субтитров.",
+        )
+        try:
+            selection = pick_paths(
+                payload.kind,
+                recursive=recursive,
+                accept_path=(lambda path: _is_folder_source(path, settings.target_lang) if recursive else True),
+                progress_callback=lambda event: _update_preparation(operation_id, event),
+            )
+            if selection.folder is None and not selection.paths:
+                _finish_preparation(operation_id, "Выбор субтитров отменён.")
+                return _selection_payload(selection, [], recursive=recursive)
+            items = _build_items(
+                selection.paths,
+                settings,
+                progress_callback=lambda event: _update_preparation(operation_id, event),
+            )
+        except PickerError as exc:
+            _fail_preparation(operation_id, exc)
+            _WEB_LOGGER.exception("Системный выбор субтитров завершился ошибкой.")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            _fail_preparation(operation_id, "Не удалось завершить выбор локальных субтитров.")
+            _WEB_LOGGER.exception("Необработанная ошибка системного выбора субтитров.")
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось завершить выбор локальных субтитров.",
+            ) from exc
+        _finish_preparation(operation_id, f"Подготовка завершена: файлов — {len(items)}.")
+        return _selection_payload(selection, items, recursive=recursive)
 
 
-@app.post("/api/refresh")
+@app.post(
+    "/api/refresh",
+    responses={
+        400: {"description": "Выбранный каталог недоступен или некорректен."},
+        500: {"description": "Не удалось обновить выбранные субтитры."},
+    },
+)
 def refresh(payload: RefreshRequest) -> dict[str, Any]:
-    paths = [Path(value) for value in payload.paths]
-    return {"items": _build_items(paths, payload.settings)}
+    with _picker_refresh_lock:
+        operation_id = _begin_preparation(
+            "refresh",
+            phase="collecting",
+            message="Начато обновление выбранных субтитров.",
+        )
+        try:
+            paths, folder, recursive = _expand_refresh_paths(
+                payload,
+                progress_callback=lambda event: _update_preparation(operation_id, event),
+            )
+            items = _build_items(
+                paths,
+                payload.settings,
+                progress_callback=lambda event: _update_preparation(operation_id, event),
+            )
+        except PickerError as exc:
+            _fail_preparation(operation_id, exc)
+            _WEB_LOGGER.exception("Обновление каталога субтитров завершилось ошибкой.")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            _fail_preparation(operation_id, "Не удалось обновить выбранные субтитры.")
+            _WEB_LOGGER.exception("Необработанная ошибка обновления выбранных субтитров.")
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось обновить выбранные субтитры.",
+            ) from exc
+        _finish_preparation(operation_id, f"Обновление завершено: файлов — {len(items)}.")
+        return {
+            "path": str(folder) if folder else "",
+            "paths": [str(path) for path in paths],
+            "items": items,
+            "recursive": recursive,
+        }
 
 
 def _resolve_agent_prompts(settings: TranslationSettings) -> tuple[str, str, str]:
@@ -776,7 +994,6 @@ def _start_warnings_capture(
 ) -> WarningsCapture | None:
     if not verbose:
         return None
-    logging.captureWarnings(True)
     warnings_logger = logging.getLogger("py.warnings")
     state = WarningsCapture(
         logger=warnings_logger,
@@ -785,11 +1002,16 @@ def _start_warnings_capture(
         previous_filters=warnings.filters[:],
         handler_attached=queue_handler not in warnings_logger.handlers,
     )
-    warnings_logger.setLevel(logging.WARNING)
-    warnings_logger.propagate = False
-    warnings.simplefilter("always")
-    if state.handler_attached:
-        warnings_logger.addHandler(queue_handler)
+    try:
+        logging.captureWarnings(True)
+        warnings_logger.setLevel(logging.WARNING)
+        warnings_logger.propagate = False
+        warnings.simplefilter("always")
+        if state.handler_attached:
+            warnings_logger.addHandler(queue_handler)
+    except Exception:
+        _stop_warnings_capture(state, queue_handler)
+        raise
     return state
 
 
@@ -938,32 +1160,104 @@ def _report_batch_result(
 
 def _finish_job(job: TranslationJob, status: str) -> None:
     global _active_job_id
-    _emit_job_event(job, {"type": "done", "status": status})
     with job.lock:
+        unresolved = []
+        for path in job.paths:
+            path_key = str(path)
+            state = job.file_states.get(path_key, {})
+            if state.get("state") not in _TERMINAL_FILE_STATES:
+                unresolved.append(path_key)
+                job.file_states[path_key] = {
+                    **state,
+                    "state": "error",
+                    "progress": 100,
+                    "error": "Файл не был обработан до завершения задачи.",
+                }
+        if unresolved:
+            status = "error" if len(unresolved) == len(job.paths) else "partial"
+        job.status = status
         job.completed = True
         job.completed_at = time.monotonic()
-    with _active_job_lock:
-        if _active_job_id == job.job_id:
-            _active_job_id = None
+    try:
+        _emit_job_event(job, {"type": "done", "status": status})
+    except Exception:
+        _safe_web_exception("Не удалось опубликовать итог веб-задачи %s.", job.job_id)
+    finally:
+        with _active_job_lock:
+            if _active_job_id == job.job_id:
+                _active_job_id = None
+
+
+def _safe_web_exception(message: str, *args: object) -> None:
+    try:
+        _WEB_LOGGER.exception(message, *args)
+    except Exception:
+        return
+
+
+def _safe_job_error(logger: logging.Logger | None, message: str) -> None:
+    if logger is None:
+        return
+    try:
+        logger.error(message)
+    except Exception:
+        _safe_web_exception("Не удалось записать ошибку веб-задачи в её журнал.")
+
+
+def _safe_cleanup(action: Callable[[], None], message: str) -> None:
+    try:
+        action()
+    except Exception:
+        _safe_web_exception(message)
+
+
+def _cleanup_job_logging(
+    logger: logging.Logger | None,
+    queue_handler: QueueLogHandler | None,
+    warnings_capture: WarningsCapture | None,
+    *,
+    agent_mode: bool,
+) -> None:
+    if queue_handler is None:
+        return
+    if agent_mode:
+        _safe_cleanup(
+            partial(detach_log_handler, queue_handler),
+            "Не удалось отсоединить журнал агента от веб-задачи.",
+        )
+    if warnings_capture is not None:
+        _safe_cleanup(
+            partial(_stop_warnings_capture, warnings_capture, queue_handler),
+            "Не удалось восстановить обработчик предупреждений веб-задачи.",
+        )
+    if logger is not None:
+        _safe_cleanup(
+            partial(logger.removeHandler, queue_handler),
+            "Не удалось отсоединить обработчик журнала веб-задачи.",
+        )
+    _safe_cleanup(queue_handler.close, "Не удалось закрыть обработчик журнала веб-задачи.")
 
 
 def _run_job(job: TranslationJob) -> None:
-    logger = _get_logger(f"sub_translate_job_{job.job_id}", verbose=job.settings.verbose)
-    queue_handler = QueueLogHandler(job.events, on_emit=partial(_record_job_event, job))
-    queue_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(queue_handler)
+    logger: logging.Logger | None = None
+    queue_handler: QueueLogHandler | None = None
+    warnings_capture: WarningsCapture | None = None
     agent_mode = job.settings.api == "agent"
-    if agent_mode:
-        attach_log_handler(queue_handler)
-    warnings_capture = _start_warnings_capture(job.settings.verbose, queue_handler)
     status = "error"
     try:
+        logger = _get_logger(f"sub_translate_job_{job.job_id}", verbose=job.settings.verbose)
+        queue_handler = QueueLogHandler(job.events, on_emit=partial(_record_job_event, job))
+        queue_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(queue_handler)
+        if agent_mode:
+            attach_log_handler(queue_handler)
+        warnings_capture = _start_warnings_capture(job.settings.verbose, queue_handler)
         if agent_mode:
             try:
                 job.prompt_signatures = _apply_agent_prompts(job.settings)
             except Exception:
-                _WEB_LOGGER.exception("Не удалось загрузить промпты агента.")
-                logger.error("Не удалось загрузить промпты агента.")
+                _safe_web_exception("Не удалось загрузить промпты агента.")
+                _safe_job_error(logger, "Не удалось загрузить промпты агента.")
                 return
         total = len(job.paths)
         _emit_job_event(job, {"type": "job", "total": total})
@@ -980,73 +1274,116 @@ def _run_job(job: TranslationJob) -> None:
         )
         status = "ok" if all(result.successful for result in results) else "partial"
     except Exception:
-        _WEB_LOGGER.exception("Необработанная ошибка веб-задачи %s.", job.job_id)
-        logger.error("Задача перевода завершилась с ошибкой.")
+        _safe_web_exception("Необработанная ошибка веб-задачи %s.", job.job_id)
+        _safe_job_error(logger, "Задача перевода завершилась с ошибкой.")
     finally:
+        _cleanup_job_logging(
+            logger,
+            queue_handler,
+            warnings_capture,
+            agent_mode=agent_mode,
+        )
         _finish_job(job, status)
-        if agent_mode:
-            detach_log_handler(queue_handler)
-        _stop_warnings_capture(warnings_capture, queue_handler)
-        logger.removeHandler(queue_handler)
-        queue_handler.close()
+
+
+def _start_translation_job(paths: list[Path], settings: TranslationSettings) -> str:
+    global _active_job_id
+    job_id = uuid.uuid4().hex
+    try:
+        with _active_job_lock:
+            if _active_job_id is not None:
+                raise HTTPException(status_code=409, detail="Перевод уже выполняется.")
+
+            events: queue.Queue[dict[str, Any]] = BoundedEventQueue(MAX_EVENTS_PER_JOB)
+            job = TranslationJob(
+                job_id=job_id,
+                paths=paths,
+                settings=settings,
+                events=events,
+                thread=None,
+                job_total=len(paths),
+            )
+            thread = threading.Thread(
+                target=_run_job,
+                args=(job,),
+                name=f"sub-translate-{job_id}",
+                daemon=False,
+            )
+            job.thread = thread
+            with _jobs_lock:
+                _jobs[job_id] = job
+                try:
+                    _prune_jobs_locked(time.monotonic())
+                except Exception:
+                    _jobs.pop(job_id, None)
+                    raise
+            _active_job_id = job_id
+            try:
+                thread.start()
+            except Exception:
+                with _jobs_lock:
+                    _jobs.pop(job_id, None)
+                if _active_job_id == job_id:
+                    _active_job_id = None
+                raise
+    except HTTPException:
+        raise
+    except Exception:
+        _safe_web_exception("Не удалось запустить веб-задачу перевода %s.", job_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Не удалось запустить задачу перевода.",
+        ) from None
+    return job_id
 
 
 @app.post(
     "/api/translate",
     responses={
         400: {"description": "Не передан ни один поддерживаемый файл."},
-        409: {"description": "Другая задача перевода уже выполняется."},
+        409: {"description": "Подготовка файлов или другая задача перевода уже выполняется."},
+        503: {"description": "Не удалось запустить задачу перевода."},
     },
 )
 def translate(payload: TranslateRequest) -> dict[str, Any]:
-    global _active_job_id
     paths = [Path(value) for value in payload.paths]
     paths = [path for path in paths if _is_subtitle(path)]
     if not paths:
         raise HTTPException(status_code=400, detail="Список файлов пуст.")
-
-    with _active_job_lock:
-        if _active_job_id is not None:
-            raise HTTPException(status_code=409, detail="Перевод уже выполняется.")
-
-        job_id = uuid.uuid4().hex
-        events: queue.Queue[dict[str, Any]] = BoundedEventQueue(MAX_EVENTS_PER_JOB)
-        job = TranslationJob(
-            job_id=job_id,
-            paths=paths,
-            settings=payload.settings,
-            events=events,
-            thread=None,
-            job_total=len(paths),
-        )
-        thread = threading.Thread(
-            target=_run_job,
-            args=(job,),
-            name=f"sub-translate-{job_id}",
-            daemon=False,
-        )
-        job.thread = thread
-        with _jobs_lock:
-            _jobs[job_id] = job
-            _prune_jobs_locked(time.monotonic())
-        _active_job_id = job_id
-
-    assert job.thread is not None
-    job.thread.start()
-    return {"job_id": job_id}
+    if not _picker_refresh_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_PREPARATION_IN_PROGRESS_ERROR)
+    try:
+        if preparation_registry.snapshot()["active"]:
+            raise HTTPException(status_code=409, detail=_PREPARATION_IN_PROGRESS_ERROR)
+        return {"job_id": _start_translation_job(paths, payload.settings)}
+    finally:
+        _picker_refresh_lock.release()
 
 
 @app.post(
     "/api/unload",
-    responses={500: {"description": "Не удалось выгрузить локальную модель."}},
+    responses={
+        409: {"description": "Подготовка или перевод уже выполняется."},
+        500: {"description": "Не удалось выгрузить локальную модель."},
+    },
 )
 def unload_models() -> dict[str, str]:
     """Принудительно выгружает все модели из памяти."""
+    if not _picker_refresh_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_PREPARATION_IN_PROGRESS_ERROR)
     try:
-        unload_all_local_translators()
-    except Exception as exc:
-        _WEB_LOGGER.error("Не удалось выгрузить локальную модель (%s).", type(exc).__name__)
-        raise HTTPException(status_code=500, detail="Не удалось выгрузить локальную модель.") from None
+        if preparation_registry.snapshot()["active"]:
+            raise HTTPException(status_code=409, detail=_PREPARATION_IN_PROGRESS_ERROR)
+        with _active_job_lock:
+            if _active_job_id is not None:
+                raise HTTPException(status_code=409, detail="Перевод уже выполняется.")
+            try:
+                unload_all_local_translators()
+            except Exception as exc:
+                _WEB_LOGGER.error("Не удалось выгрузить локальную модель (%s).", type(exc).__name__)
+                raise HTTPException(status_code=500, detail="Не удалось выгрузить локальную модель.") from None
+    finally:
+        _picker_refresh_lock.release()
     return {"status": "ok", "message": "Модели выгружены."}
 
 
@@ -1064,6 +1401,16 @@ def stream(job_id: str) -> StreamingResponse:
             try:
                 event = job.events.get(timeout=1.0)
             except queue.Empty:
+                with job.lock:
+                    completed = job.completed
+                    status = job.status
+                if completed:
+                    payload = json.dumps(
+                        {"type": "done", "status": status},
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {payload}\n\n"
+                    break
                 yield ": keep-alive\n\n"
                 continue
             payload = json.dumps(event, ensure_ascii=False)

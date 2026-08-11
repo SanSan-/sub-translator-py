@@ -1,8 +1,10 @@
 "use strict";
 
 const picker = document.getElementById("picker");
+const pickerHint = document.getElementById("pickerHint");
 const pickerFileBtn = document.getElementById("pickerFileBtn");
 const pickerFolderBtn = document.getElementById("pickerFolderBtn");
+const refreshBtn = document.getElementById("refreshBtn");
 const translateBtn = document.getElementById("translateBtn");
 const unloadBtn = document.getElementById("unloadBtn");
 const fileList = document.getElementById("fileList");
@@ -40,7 +42,15 @@ const smartSplitInputs = smartSplitModal
   : [];
 
 const SETTINGS_STORAGE_KEY = "subTranslateSettings";
+const BROWSER_LOG_LIMIT = 500;
 const JOB_ID_PATTERN = /^[a-f0-9]{32}$/;
+const PREPARATION_STATUS_PATH = "/api/preparation-status";
+const PREPARATION_POLL_INTERVAL_MS = 400;
+const PREPARATION_STATUS_TIMEOUT_MS = 4000;
+const PREPARATION_STALE_WARNING_MS = 12000;
+const CARD_PAGE_SIZE = 200;
+const JOB_SYNC_RETRY_DELAY_MS = 500;
+const DEFAULT_PICKER_HINT = "ASS, SRT и VTT; папка включает все подпапки";
 const volatileSettingKeys = new Set([
   "agent_system_prompt",
   "agent_prompt",
@@ -72,7 +82,11 @@ const agentApis = new Set(["agent"]);
 const state = {
   items: [],
   itemMap: new Map(),
+  itemDataMap: new Map(),
+  itemPage: 0,
   mode: null,
+  sourcePaths: [],
+  selectionLabel: "Папка не выбрана",
   jobId: null,
   jobTotal: 0,
   jobDone: 0,
@@ -80,20 +94,103 @@ const state = {
   uiConfig: null,
   lastThreadValue: null,
   agentConfigured: false,
+  isBusy: false,
+  isPreparing: false,
+  itemRequestGeneration: 0,
+  itemRequestController: null,
+  preparationGeneration: 0,
+  preparationOperationId: null,
+  preparationLogKeys: new Set(),
+  logLines: [],
+  eventSource: null,
+  jobSnapshotTimer: null,
+  jobSnapshotInProgress: false,
+  jobSnapshotErrorShown: false,
+  jobSnapshotReason: "disconnect",
+  activeJobRetryTimer: null,
+  activeJobRetryInProgress: false,
+  activeJobSyncErrorShown: false,
+  activeJobRecoveryContext: null,
+  jobAuthorityTimer: null,
+  jobAuthorityInProgress: false,
+  jobAuthorityErrorShown: false,
+  jobUnlockContext: null,
 };
 
 function appendLog(message) {
-  const line = message.endsWith("\n") ? message : `${message}\n`;
-  logConsole.textContent += line;
+  if (message === undefined || message === null) {
+    return;
+  }
+  const lines = String(message).replaceAll("\r\n", "\n").split("\n");
+  if (lines.at(-1) === "") {
+    lines.pop();
+  }
+  state.logLines.push(...lines);
+  if (state.logLines.length > BROWSER_LOG_LIMIT) {
+    state.logLines.splice(0, state.logLines.length - BROWSER_LOG_LIMIT);
+  }
+  logConsole.textContent = state.logLines.length > 0 ? `${state.logLines.join("\n")}\n` : "";
   logConsole.scrollTop = logConsole.scrollHeight;
 }
 
 function setTranslateBusy(isBusy) {
-  translateBtn.disabled = isBusy || state.items.length === 0;
+  state.isBusy = isBusy;
   translateBtn.textContent = isBusy ? "Перевод: 0/0" : "Перевести";
-  if (unloadBtn) {
-    unloadBtn.disabled = isBusy;
+  updateInteractionState();
+}
+
+function setPickerHint(message, title = "") {
+  if (!pickerHint) {
+    return;
   }
+  pickerHint.textContent = message || DEFAULT_PICKER_HINT;
+  pickerHint.title = title;
+}
+
+function updateInteractionState() {
+  const locked = state.isBusy || state.isPreparing;
+  picker.classList.toggle("disabled", locked);
+  picker.setAttribute("aria-busy", String(state.isPreparing));
+  picker.setAttribute("aria-disabled", String(locked));
+  pickerFileBtn.disabled = locked;
+  pickerFolderBtn.disabled = locked;
+  if (refreshBtn) {
+    refreshBtn.disabled = locked || (state.items.length === 0 && state.sourcePaths.length === 0);
+  }
+  translateBtn.disabled = locked || state.items.length === 0;
+  if (unloadBtn) {
+    unloadBtn.disabled = locked;
+  }
+}
+
+function setPreparing(isPreparing) {
+  state.isPreparing = isPreparing;
+  updateInteractionState();
+}
+
+function abortItemRequest() {
+  state.itemRequestGeneration += 1;
+  if (state.itemRequestController) {
+    state.itemRequestController.abort();
+    state.itemRequestController = null;
+  }
+}
+
+function beginItemRequest() {
+  abortItemRequest();
+  const controller = new AbortController();
+  state.itemRequestController = controller;
+  return { controller, generation: state.itemRequestGeneration };
+}
+
+function completeItemRequest(controller) {
+  if (state.itemRequestController === controller) {
+    state.itemRequestController = null;
+  }
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError";
 }
 
 function updateTranslateProgress() {
@@ -102,16 +199,6 @@ function updateTranslateProgress() {
     return;
   }
   translateBtn.textContent = `Перевод: ${state.jobDone}/${state.jobTotal}`;
-}
-
-function debounce(fn, delay) {
-  let timer = null;
-  return (...args) => {
-    if (timer) {
-      clearTimeout(timer);
-    }
-    timer = setTimeout(() => fn(...args), delay);
-  };
 }
 
 function setInputDefaults(input, value) {
@@ -389,7 +476,6 @@ function closeSmartSplitModal(restore) {
   smartSplitModal.hidden = true;
   updateSmartSplitStatus();
   persistSettings();
-  refreshDebounced();
 }
 
 function openPromptModal(modal, area) {
@@ -584,13 +670,27 @@ function readSettings() {
   return data;
 }
 
-async function postJson(url, payload) {
+async function getJson(url, options = {}) {
+  const response = await fetch(url, {
+    headers: { Accept: "application/json" },
+    cache: "no-store",
+    signal: options.signal,
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+async function postJson(url, payload, options = {}) {
   const response = await fetch(url, {
     method: "POST",
     headers: {
+      "Accept": "application/json",
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal: options.signal,
   });
 
   if (!response.ok) {
@@ -603,18 +703,296 @@ async function postJson(url, payload) {
     } catch {
       detail = response.statusText || "Сервер вернул некорректный ответ.";
     }
-    throw new Error(detail);
+    const error = new Error(detail);
+    error.status = response.status;
+    throw error;
   }
 
   return response.json();
 }
 
+function preparationStatusGeneration(status) {
+  const generation = Number(status?.generation);
+  return Number.isSafeInteger(generation) && generation >= 0 ? generation : 0;
+}
+
+async function getPreparationStatus(signal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const forwardAbort = () => controller.abort();
+  if (signal?.aborted) {
+    controller.abort();
+  } else if (signal) {
+    signal.addEventListener("abort", forwardAbort, { once: true });
+  }
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, PREPARATION_STATUS_TIMEOUT_MS);
+  try {
+    return await getJson(PREPARATION_STATUS_PATH, { signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      throw new Error("Локальный сервис не ответил на запрос состояния подготовки.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
+function resetPreparationLogCursor(status) {
+  const operationId = status?.operation_id ? String(status.operation_id) : null;
+  if (operationId !== state.preparationOperationId) {
+    state.preparationOperationId = operationId;
+    state.preparationLogKeys = new Set();
+  }
+}
+
+function preparationCounter(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : 0;
+}
+
+function preparationTotal(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : null;
+}
+
+function preparationSummary(status) {
+  const discovered = preparationCounter(status?.discovered);
+  const processed = preparationCounter(status?.processed);
+  const total = preparationTotal(status?.total);
+  const boundedProcessed = total === null ? processed : Math.min(processed, total);
+  if (status?.status === "error") {
+    return "Ошибка подготовки списка";
+  }
+  if (!status?.active && status?.status === "done") {
+    return `Список готов: ${total ?? Math.max(processed, discovered)} файлов`;
+  }
+  if (status?.phase === "dialog") {
+    return "Ожидается выбор в системном диалоге…";
+  }
+  if (status?.phase === "collecting") {
+    return `Рекурсивный поиск: найдено ${discovered}`;
+  }
+  if (status?.phase === "probing") {
+    return total === null ? `Подготовлено: ${processed}` : `Подготовлено: ${boundedProcessed}/${total}`;
+  }
+  if (status?.phase === "queueing") {
+    return total === null
+      ? `Формируется список: ${processed}`
+      : `Формируется список: ${boundedProcessed}/${total}`;
+  }
+  return "Подготавливается список…";
+}
+
+function appendPreparationStatus(status, baselineGeneration, expectedOperation) {
+  const generation = preparationStatusGeneration(status);
+  if (generation <= baselineGeneration || status?.operation !== expectedOperation) {
+    return false;
+  }
+  state.preparationGeneration = Math.max(state.preparationGeneration, generation);
+  resetPreparationLogCursor(status);
+  const entries = Array.isArray(status.logs) ? status.logs : [];
+  entries.forEach((entry) => {
+    const message = String(entry?.message || "").trim();
+    const key = `log:${String(entry?.id ?? message)}`;
+    if (message && !state.preparationLogKeys.has(key)) {
+      state.preparationLogKeys.add(key);
+      appendLog(message);
+    }
+  });
+  const message = String(status?.message || "").trim();
+  setPickerHint(preparationSummary(status), message);
+  const messageKey = `message:${message}`;
+  if (message && entries.length === 0 && !state.preparationLogKeys.has(messageKey)) {
+    state.preparationLogKeys.add(messageKey);
+    appendLog(message);
+  }
+  const error = String(status?.error || "").trim();
+  const errorKey = `error:${error}`;
+  if (error && !state.preparationLogKeys.has(errorKey)) {
+    state.preparationLogKeys.add(errorKey);
+    appendLog(`Ошибка подготовки: ${error}`);
+  }
+  return true;
+}
+
+function preparationDelay(signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve(false);
+      return;
+    }
+    const finish = (continued) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", stop);
+      resolve(continued);
+    };
+    const stop = () => finish(false);
+    const timer = setTimeout(() => finish(true), PREPARATION_POLL_INTERVAL_MS);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+}
+
+function isPreparationRequestActive(request) {
+  return request.generation === state.itemRequestGeneration && !request.controller.signal.aborted;
+}
+
+function createPreparationMonitorState() {
+  return {
+    lastUpdatedAt: null,
+    lastProgressAt: Date.now(),
+    staleWarningShown: false,
+    connectionWarningShown: false,
+  };
+}
+
+function recordPreparationProgress(status, monitor) {
+  const updatedAt = String(status.updated_at || "");
+  if (!updatedAt || updatedAt === monitor.lastUpdatedAt) {
+    return;
+  }
+  monitor.lastUpdatedAt = updatedAt;
+  monitor.lastProgressAt = Date.now();
+  monitor.staleWarningShown = false;
+}
+
+function handleMonitoredPreparationStatus(status, monitor, baselineGeneration, expectedOperation) {
+  monitor.connectionWarningShown = false;
+  if (!appendPreparationStatus(status, baselineGeneration, expectedOperation)) {
+    return true;
+  }
+  recordPreparationProgress(status, monitor);
+  return Boolean(status.active);
+}
+
+function handlePreparationConnectionError(error, request, monitor) {
+  if (request.controller.signal.aborted) {
+    return false;
+  }
+  if (!monitor.connectionWarningShown) {
+    appendLog(`Потеряна связь с локальным сервисом во время подготовки: ${error.message}`);
+    monitor.connectionWarningShown = true;
+  }
+  return true;
+}
+
+function reportStalePreparation(monitor) {
+  if (
+    monitor.staleWarningShown
+    || Date.now() - monitor.lastProgressAt < PREPARATION_STALE_WARNING_MS
+  ) {
+    return;
+  }
+  appendLog("Подготовка не сообщает новый прогресс более 12 секунд; ожидание продолжается.");
+  monitor.staleWarningShown = true;
+}
+
+async function monitorPreparation(request, baselineGeneration, expectedOperation, isComplete) {
+  const monitor = createPreparationMonitorState();
+  while (isPreparationRequestActive(request) && !isComplete()) {
+    if (!(await preparationDelay(request.controller.signal))) {
+      return;
+    }
+    try {
+      const status = await getPreparationStatus(request.controller.signal);
+      if (!handleMonitoredPreparationStatus(
+        status,
+        monitor,
+        baselineGeneration,
+        expectedOperation,
+      )) {
+        return;
+      }
+    } catch (error) {
+      if (!handlePreparationConnectionError(error, request, monitor)) {
+        return;
+      }
+    }
+    reportStalePreparation(monitor);
+  }
+}
+
+async function captureFinalPreparationStatus(request, baselineGeneration, expectedOperation) {
+  if (request.controller.signal.aborted) {
+    return;
+  }
+  try {
+    const status = await getPreparationStatus(request.controller.signal);
+    appendPreparationStatus(status, baselineGeneration, expectedOperation);
+  } catch (error) {
+    if (!request.controller.signal.aborted) {
+      appendLog(`Не удалось получить итог подготовки: ${error.message}`);
+    }
+  }
+}
+
+async function postWithPreparationStatus(url, payload, request, expectedOperation) {
+  let baselineGeneration = state.preparationGeneration;
+  try {
+    const baseline = await getPreparationStatus(request.controller.signal);
+    baselineGeneration = Math.max(baselineGeneration, preparationStatusGeneration(baseline));
+    state.preparationGeneration = baselineGeneration;
+  } catch (error) {
+    if (request.controller.signal.aborted) {
+      throw error;
+    }
+    appendLog(`Состояние подготовки пока недоступно: ${error.message}`);
+  }
+  let complete = false;
+  const responsePromise = postJson(url, payload, { signal: request.controller.signal });
+  const monitorPromise = monitorPreparation(
+    request,
+    baselineGeneration,
+    expectedOperation,
+    () => complete,
+  );
+  try {
+    return await responsePromise;
+  } finally {
+    complete = true;
+    await monitorPromise;
+    await captureFinalPreparationStatus(request, baselineGeneration, expectedOperation);
+  }
+}
+
+function normalizedItemStatus(item) {
+  if (item?.state && Object.hasOwn(statusLabels, item.state)) {
+    return item.state;
+  }
+  return item?.cached ? "cached" : "idle";
+}
+
+function itemProgress(item, status) {
+  const progress = Number(item?.progress);
+  if (Number.isFinite(progress)) {
+    return Math.max(0, Math.min(100, Math.round(progress)));
+  }
+  return finalStates.has(status) ? 100 : 0;
+}
+
+function applyCardState(entry, item) {
+  const status = normalizedItemStatus(item);
+  const progress = itemProgress(item, status);
+  entry.card.dataset.status = status;
+  entry.statusEl.textContent = status === "started" && progress > 0
+    ? `${statusLabels.started} ${progress}%`
+    : statusLabels[status];
+  entry.bar.style.width = `${progress}%`;
+  entry.outputEl.textContent = `-> ${item.output || ""}`;
+  entry.card.title = item.error || "";
+}
+
 function buildFileCard(item, index) {
   const card = document.createElement("div");
-  const status = item.cached ? "cached" : "idle";
   card.className = "file-card";
-  card.dataset.path = item.path;
-  card.dataset.status = status;
+  card.dataset.path = String(item.path || "");
   card.style.setProperty("--delay", `${Math.min(index, 6) * 0.05}s`);
 
   const row = document.createElement("div");
@@ -628,14 +1006,14 @@ function buildFileCard(item, index) {
 
   const name = document.createElement("div");
   name.className = "file-name";
-  name.textContent = item.name;
+  name.textContent = item.name || "Без имени";
 
   const meta = document.createElement("div");
   meta.className = "file-meta";
 
   const badge = document.createElement("span");
   badge.className = "badge";
-  badge.textContent = item.format.toUpperCase();
+  badge.textContent = String(item.format || "sub").toUpperCase();
 
   const output = document.createElement("span");
   output.className = "file-output";
@@ -646,7 +1024,6 @@ function buildFileCard(item, index) {
 
   const statusEl = document.createElement("div");
   statusEl.className = "file-status";
-  statusEl.textContent = statusLabels[status];
 
   row.append(dot, info, statusEl);
 
@@ -655,145 +1032,372 @@ function buildFileCard(item, index) {
 
   const bar = document.createElement("span");
   bar.className = "file-progress-bar";
-  bar.style.width = item.cached ? "100%" : "0%";
   progress.append(bar);
 
   card.append(row, progress);
 
-  return { card, statusEl, bar, outputEl: output };
+  const entry = { card, statusEl, bar, outputEl: output };
+  applyCardState(entry, item);
+  return entry;
 }
 
-function renderItems(items, modeLabel) {
-  state.items = items;
+function buildPagination(page, pageCount, startIndex, endIndex) {
+  const pagination = document.createElement("div");
+  pagination.className = "file-pagination";
+
+  const previous = document.createElement("button");
+  previous.className = "btn ghost file-page-button";
+  previous.type = "button";
+  previous.textContent = "Назад";
+  previous.disabled = page === 0;
+  previous.addEventListener("click", () => renderItemPage(page - 1));
+
+  const label = document.createElement("span");
+  label.className = "file-page-label";
+  label.textContent = `${startIndex + 1}–${endIndex} из ${state.items.length}`;
+
+  const next = document.createElement("button");
+  next.className = "btn ghost file-page-button";
+  next.type = "button";
+  next.textContent = "Далее";
+  next.disabled = page >= pageCount - 1;
+  next.addEventListener("click", () => renderItemPage(page + 1));
+
+  pagination.append(previous, label, next);
+  return pagination;
+}
+
+function renderItemPage(requestedPage) {
+  const pageCount = Math.max(1, Math.ceil(state.items.length / CARD_PAGE_SIZE));
+  const page = Math.max(0, Math.min(pageCount - 1, requestedPage));
+  const startIndex = page * CARD_PAGE_SIZE;
+  const endIndex = Math.min(startIndex + CARD_PAGE_SIZE, state.items.length);
+  state.itemPage = page;
   state.itemMap = new Map();
   fileList.innerHTML = "";
 
-  if (!items.length) {
+  const fragment = document.createDocumentFragment();
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const item = state.items[index];
+    const entry = buildFileCard(item, index - startIndex);
+    state.itemMap.set(String(item.path || ""), entry);
+    fragment.append(entry.card);
+  }
+  fileList.append(fragment);
+  if (pageCount > 1) {
+    fileList.append(buildPagination(page, pageCount, startIndex, endIndex));
+  }
+  fileList.dataset.renderedCount = String(endIndex - startIndex);
+  fileList.dataset.totalCount = String(state.items.length);
+  fileList.scrollTop = 0;
+}
+
+function renderItems(items, modeLabel) {
+  state.items = Array.isArray(items) ? items.map((item) => ({ ...item })) : [];
+  state.itemMap = new Map();
+  state.itemDataMap = new Map(
+    state.items.map((item) => [String(item.path || ""), item])
+  );
+  fileList.innerHTML = "";
+  fileList.dataset.renderedCount = "0";
+  fileList.dataset.totalCount = String(state.items.length);
+
+  if (modeLabel) {
+    state.selectionLabel = String(modeLabel);
+  }
+  selectedPath.textContent = state.selectionLabel;
+  selectedPath.title = state.selectionLabel;
+
+  if (!state.items.length) {
     fileList.classList.add("empty");
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "Список пуст - выберите файл или папку.";
+    empty.textContent = state.sourcePaths.length > 0
+      ? "Поддерживаемые субтитры не найдены."
+      : "Список пуст — выберите файл или папку.";
     fileList.append(empty);
-    translateBtn.disabled = true;
-    selectedPath.textContent = modeLabel || "Папка не выбрана";
+    updateInteractionState();
     return;
   }
 
   fileList.classList.remove("empty");
-  const fragment = document.createDocumentFragment();
-  items.forEach((item, index) => {
-    const entry = buildFileCard(item, index);
-    state.itemMap.set(item.path, entry);
-    fragment.append(entry.card);
-    if (
-      item.state ||
-      item.progress !== undefined ||
-      item.output ||
-      item.error
-    ) {
-      updateFileState(item.path, {
-        status: item.state,
-        progress: item.progress,
-        output: item.output,
-        error: item.error,
-      });
-    }
-  });
-  fileList.append(fragment);
-
-  translateBtn.disabled = state.jobId !== null;
-  selectedPath.textContent = modeLabel || "Выбрано файлов: " + items.length;
+  renderItemPage(0);
+  updateInteractionState();
 }
 
 function updateFileState(path, payload) {
-  const entry = state.itemMap.get(path);
+  const normalizedPath = String(path || "");
+  const item = state.itemDataMap.get(normalizedPath);
+  if (item) {
+    Object.entries(payload).forEach(([key, value]) => {
+      if (value !== undefined) {
+        item[key] = value;
+      }
+    });
+    if (payload.status) {
+      item.state = payload.status;
+    }
+  }
+  const entry = state.itemMap.get(normalizedPath);
   if (!entry) {
     return;
   }
-  if (payload.status) {
-    entry.card.dataset.status = payload.status;
-    entry.statusEl.textContent = statusLabels[payload.status] || payload.status;
-  }
-  if (payload.progress !== undefined) {
-    entry.bar.style.width = `${payload.progress}%`;
-    const status = payload.status || entry.card.dataset.status;
-    if (status === "started") {
-      entry.statusEl.textContent = `${statusLabels.started} ${payload.progress}%`;
-    }
-  }
-  if (payload.output) {
-    entry.outputEl.textContent = `-> ${payload.output}`;
-  }
-  if (payload.error) {
-    entry.card.title = payload.error;
-  }
+  applyCardState(entry, item || payload);
 }
 
 async function pick(kind) {
-  const settings = readSettings();
-  const result = await postJson("/api/pick", { kind, settings });
-  if (result.mode === "folder") {
-    renderItems(result.items || [], result.path || "Папка не выбрана");
+  if (state.isBusy || state.isPreparing) {
     return;
   }
-  renderItems(result.items || [], "Выбрано файлов: " + (result.items || []).length);
+  const request = beginItemRequest();
+  const settings = readSettings();
+  const isFolder = kind === "folder";
+  appendLog(
+    isFolder
+      ? "Открываю системный диалог выбора папки; все подпапки будут включены автоматически."
+      : "Открываю системный диалог выбора файлов."
+  );
+  setPickerHint(isFolder ? "Ожидается выбор папки…" : "Ожидается выбор файлов…");
+  setPreparing(true);
+  let result;
+  try {
+    result = await postWithPreparationStatus(
+      "/api/pick",
+      { kind, settings },
+      request,
+      "pick",
+    );
+  } finally {
+    completeItemRequest(request.controller);
+    if (request.generation === state.itemRequestGeneration) {
+      setPreparing(false);
+    }
+  }
+  if (request.generation !== state.itemRequestGeneration || state.isBusy) {
+    return;
+  }
+  if (result.cancelled) {
+    appendLog("Выбор отменён.");
+    setPickerHint("Выбор отменён", DEFAULT_PICKER_HINT);
+    return;
+  }
+  const items = Array.isArray(result.items) ? result.items : [];
+  state.mode = result.mode || kind;
+  if (state.mode === "folder" && result.path) {
+    state.sourcePaths = [String(result.path)];
+  } else if (Array.isArray(result.paths)) {
+    state.sourcePaths = result.paths.map(String);
+  } else {
+    state.sourcePaths = items.map((item) => String(item.path || "")).filter(Boolean);
+  }
+  const label = state.mode === "folder" && result.path
+    ? String(result.path)
+    : `Выбрано файлов: ${items.length}`;
+  renderItems(items, label);
+  if (items.length === 0) {
+    appendLog("Поддерживаемые субтитры ASS, SRT или VTT не найдены.");
+  } else {
+    appendLog(`Список подготовлен: ${items.length} файлов.`);
+  }
+  setPickerHint(`Список готов: ${items.length} файлов`, DEFAULT_PICKER_HINT);
 }
 
 async function runPick(kind) {
   try {
     await pick(kind);
   } catch (err) {
+    if (isAbortError(err)) {
+      return;
+    }
     appendLog(`Ошибка выбора: ${err?.message || "неизвестная ошибка"}`);
+    setPickerHint("Ошибка выбора", err?.message || "Неизвестная ошибка");
   }
 }
 
 async function refreshCache() {
-  if (state.items.length === 0 || state.jobId) {
+  if (
+    (state.items.length === 0 && state.sourcePaths.length === 0)
+    || state.isBusy
+    || state.isPreparing
+  ) {
     return;
   }
+  const request = beginItemRequest();
   const settings = readSettings();
-  const paths = state.items.map((item) => item.path);
-  const result = await postJson("/api/refresh", { paths, settings });
-  renderItems(result.items || [], selectedPath.textContent);
-}
-
-async function loadActiveJob() {
+  const recursive = state.mode === "folder";
+  const paths = state.sourcePaths.length > 0
+    ? [...state.sourcePaths]
+    : state.items.map((item) => item.path);
+  appendLog(recursive ? "Повторно собираю субтитры из папки и всех подпапок." : "Обновляю выбранные файлы.");
+  setPickerHint(recursive ? "Повторный рекурсивный поиск…" : "Обновляется список…");
+  setPreparing(true);
   let result;
   try {
-    const response = await fetch("/api/active-job");
-    if (!response.ok) {
-      return;
+    result = await postWithPreparationStatus(
+      "/api/refresh",
+      { paths, settings, recursive },
+      request,
+      "refresh",
+    );
+  } finally {
+    completeItemRequest(request.controller);
+    if (request.generation === state.itemRequestGeneration) {
+      setPreparing(false);
     }
-    result = await response.json();
-  } catch (err) {
-    appendLog(`Ошибка синхронизации: ${err.message}`);
+  }
+  if (request.generation !== state.itemRequestGeneration || state.isBusy) {
     return;
   }
-  if (!result?.active) {
-    return;
+  const items = Array.isArray(result.items) ? result.items : [];
+  if (!recursive && Array.isArray(result.paths)) {
+    state.sourcePaths = result.paths.map(String);
   }
-  const items = result.items || [];
-  renderItems(items, `Перевод: ${items.length} файлов`);
+  renderItems(items, result.path || state.selectionLabel);
+  setPickerHint(`Список готов: ${items.length} файлов`, DEFAULT_PICKER_HINT);
+}
+
+async function fetchActiveJobSnapshot() {
+  const response = await fetch("/api/active-job", {
+    headers: { Accept: "application/json" },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const result = await response.json();
+  if (!result || typeof result.active !== "boolean") {
+    throw new TypeError("Сервер вернул некорректное состояние задачи.");
+  }
+  return result;
+}
+
+async function fetchJobSnapshot(jobId) {
+  if (!JOB_ID_PATTERN.test(jobId)) {
+    throw new Error("Некорректный идентификатор задачи.");
+  }
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    headers: { Accept: "application/json" },
+    cache: "no-store",
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const result = await response.json();
+  const allowedStatuses = new Set(["running", "ok", "partial", "error"]);
+  if (
+    !result
+    || typeof result !== "object"
+    || typeof result.job_id !== "string"
+    || typeof result.completed !== "boolean"
+    || typeof result.status !== "string"
+    || !Array.isArray(result.items)
+    || !Array.isArray(result.logs)
+  ) {
+    throw new TypeError("Сервер вернул некорректную структуру снимка задачи.");
+  }
+  if (result.job_id !== jobId || !allowedStatuses.has(result.status)) {
+    throw new Error("Сервер вернул некорректный снимок задачи.");
+  }
+  return result;
+}
+
+function replaceJobLogs(logs) {
+  state.logLines = [];
+  logConsole.textContent = "";
+  if (Array.isArray(logs)) {
+    logs.forEach((line) => appendLog(line));
+  }
+}
+
+function appendLogOnce(message) {
+  if (!state.logLines.includes(message)) {
+    appendLog(message);
+  }
+}
+
+function normalizedJobCounter(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback;
+}
+
+function applyJobSnapshot(result) {
+  if (!JOB_ID_PATTERN.test(result.job_id)) {
+    throw new Error("Сервер вернул некорректный идентификатор активной задачи.");
+  }
+  if (!Array.isArray(result.items) || !Array.isArray(result.logs)) {
+    throw new TypeError("Сервер вернул некорректное содержимое задачи.");
+  }
+  const items = result.items;
+  const preserveFolderContext = (
+    state.jobId === result.job_id
+    && state.mode === "folder"
+    && state.sourcePaths.length === 1
+  );
+  const selectionLabel = preserveFolderContext
+    ? state.selectionLabel
+    : `Перевод: ${items.length} файлов`;
+  if (!preserveFolderContext) {
+    state.mode = "files";
+    state.sourcePaths = items.map((item) => String(item.path || "")).filter(Boolean);
+  }
+  renderItems(items, selectionLabel);
   state.jobId = result.job_id;
-  state.jobTotal = Number.isFinite(result.total) ? result.total : items.length;
-  state.jobDone = Number.isFinite(result.done) ? result.done : 0;
   state.completed = new Set();
   items.forEach((item) => {
     if (finalStates.has(item.state)) {
       state.completed.add(item.path);
     }
   });
-  if (Array.isArray(result.logs)) {
-    logConsole.textContent = "";
-    result.logs.forEach((line) => appendLog(line));
-  }
+  state.jobTotal = Math.max(items.length, normalizedJobCounter(result.total, items.length));
+  state.jobDone = Math.min(
+    state.jobTotal,
+    Math.max(state.completed.size, normalizedJobCounter(result.done)),
+  );
+  replaceJobLogs(result.logs);
   setTranslateBusy(true);
   updateTranslateProgress();
+}
+
+async function loadActiveJob(options = {}) {
+  const reportError = options.reportError !== false;
+  let result;
+  try {
+    result = await fetchActiveJobSnapshot();
+  } catch (error) {
+    if (reportError) {
+      appendLog(`Ошибка синхронизации: ${error.message}`);
+    }
+    return { outcome: "error", error };
+  }
+  if (!result.active) {
+    return { outcome: "inactive" };
+  }
+  try {
+    applyJobSnapshot(result);
+  } catch (error) {
+    if (reportError) {
+      appendLog(`Ошибка синхронизации: ${error.message}`);
+    }
+    return { outcome: "error", error };
+  }
   listenJob(result.job_id);
+  return { outcome: "active" };
+}
+
+function reportRefreshError(error) {
+  if (isAbortError(error)) {
+    return;
+  }
+  const message = error?.message || "неизвестная ошибка";
+  appendLog(`Ошибка обновления: ${message}`);
+  setPickerHint("Ошибка обновления списка", message);
 }
 
 async function translate() {
-  if (state.items.length === 0 || state.jobId) {
+  if (state.items.length === 0 || state.jobId || state.isBusy) {
     return;
   }
   setTranslateBusy(true);
@@ -810,77 +1414,397 @@ async function translate() {
     appendLog("Запущен перевод.\n");
     listenJob(result.job_id);
   } catch (err) {
-    if (String(err.message || "").includes("Перевод уже выполняется")) {
-      await loadActiveJob();
+    if (err.status === 409 || String(err.message || "").includes("Перевод уже выполняется")) {
+      appendLog("Сервер сообщил о выполняющемся переводе; синхронизирую состояние.");
+      await beginActiveJobRecovery("conflict");
       return;
     }
     appendLog(`Ошибка запуска: ${err.message}`);
+    const status = Number(err.status);
+    if (!Number.isInteger(status) || status >= 500) {
+      appendLog("Результат запуска неоднозначен; проверяю активную задачу на сервере.");
+      await beginActiveJobRecovery("ambiguous");
+      return;
+    }
     state.jobId = null;
     setTranslateBusy(false);
   }
 }
 
-function listenJob(jobId) {
-  if (!JOB_ID_PATTERN.test(jobId)) {
-    appendLog("Сервер вернул некорректный идентификатор задачи.\n");
-    state.jobId = null;
-    setTranslateBusy(false);
+function clearJobSnapshotTimer() {
+  if (state.jobSnapshotTimer !== null) {
+    clearTimeout(state.jobSnapshotTimer);
+    state.jobSnapshotTimer = null;
+  }
+}
+
+function clearActiveJobRetryTimer() {
+  if (state.activeJobRetryTimer !== null) {
+    clearTimeout(state.activeJobRetryTimer);
+    state.activeJobRetryTimer = null;
+  }
+}
+
+function clearJobAuthorityTimer() {
+  if (state.jobAuthorityTimer !== null) {
+    clearTimeout(state.jobAuthorityTimer);
+    state.jobAuthorityTimer = null;
+  }
+}
+
+function closeJobStream(stream = state.eventSource) {
+  if (!stream) {
     return;
   }
+  stream.onopen = null;
+  stream.onmessage = null;
+  stream.onerror = null;
+  stream.close();
+  if (state.eventSource === stream) {
+    state.eventSource = null;
+  }
+}
+
+function releaseJobLock(message, hint = DEFAULT_PICKER_HINT, hintTitle = "") {
+  clearJobSnapshotTimer();
+  clearActiveJobRetryTimer();
+  clearJobAuthorityTimer();
+  closeJobStream();
+  state.jobId = null;
+  state.jobSnapshotErrorShown = false;
+  state.activeJobSyncErrorShown = false;
+  state.activeJobRecoveryContext = null;
+  state.jobAuthorityErrorShown = false;
+  state.jobUnlockContext = null;
+  if (message) {
+    appendLogOnce(message);
+  }
+  setPickerHint(hint, hintTitle);
+  setTranslateBusy(false);
+}
+
+function completedJobMessage(status) {
+  if (status === "ok") {
+    return "Перевод завершён.";
+  }
+  if (status === "partial") {
+    return "Перевод завершён с ошибками.";
+  }
+  return "Перевод завершился с ошибкой.";
+}
+
+function beginJobUnlock(jobId, message, hint = DEFAULT_PICKER_HINT, hintTitle = "") {
+  state.jobUnlockContext = { jobId, message, hint, hintTitle };
+  scheduleJobAuthorityReconcile(jobId, 0);
+}
+
+function applyFileJobEvent(payload) {
+  updateFileState(payload.path, {
+    status: payload.state,
+    progress: payload.progress,
+    output: payload.output,
+    error: payload.error,
+  });
+  if (finalStates.has(payload.state) && !state.completed.has(payload.path)) {
+    state.completed.add(payload.path);
+    state.jobDone += 1;
+    updateTranslateProgress();
+  }
+}
+
+function applyJobEvent(stream, payload, jobId) {
+  if (payload.type === "log") {
+    appendLog(payload.message);
+    return;
+  }
+  if (payload.type === "job") {
+    state.jobTotal = payload.total;
+    updateTranslateProgress();
+    return;
+  }
+  if (payload.type === "file") {
+    applyFileJobEvent(payload);
+    return;
+  }
+  if (payload.type === "done") {
+    closeJobStream(stream);
+    appendLogOnce("Получен итог задачи; загружаю окончательный снимок.");
+    setPickerHint("Синхронизируется итог задачи", "Кнопки останутся заблокированными до итогового снимка.");
+    scheduleJobSnapshotSync(jobId, 0, "terminal");
+  }
+}
+
+function handleJobStreamMessage(stream, event, jobId) {
+  if (state.eventSource !== stream || !event.data) {
+    return;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(event.data);
+  } catch {
+    appendLog("Получено повреждённое событие задачи.");
+    return;
+  }
+  applyJobEvent(stream, payload, jobId);
+}
+
+function scheduleJobSnapshotSync(jobId, delay = JOB_SYNC_RETRY_DELAY_MS, reason = "disconnect") {
+  if (
+    state.jobSnapshotTimer !== null
+    || state.jobSnapshotInProgress
+    || !state.isBusy
+    || state.jobId !== jobId
+  ) {
+    return;
+  }
+  state.jobSnapshotReason = reason;
+  state.jobSnapshotTimer = setTimeout(() => {
+    state.jobSnapshotTimer = null;
+    synchronizeJobSnapshot(jobId);
+  }, delay);
+}
+
+function reportJobSnapshotFailure(jobId, error) {
+  if (!state.isBusy || state.jobId !== jobId) {
+    return;
+  }
+  if (!state.jobSnapshotErrorShown) {
+    appendLog(`Не удалось получить снимок задачи: ${error.message}. Повторяю проверку.`);
+    state.jobSnapshotErrorShown = true;
+  }
+  scheduleJobSnapshotSync(jobId, JOB_SYNC_RETRY_DELAY_MS, state.jobSnapshotReason);
+}
+
+function reportRunningJobSnapshot() {
+  if (state.jobSnapshotReason === "terminal") {
+    appendLogOnce("Сервер ещё формирует итоговый снимок задачи; повторяю проверку.");
+    setPickerHint("Синхронизируется итог задачи", "Кнопки останутся заблокированными до итогового снимка.");
+    return;
+  }
+  appendLogOnce("Поток событий оборвался. Состояние задачи восстановлено по снимку.");
+  setPickerHint("Связь с задачей восстанавливается", "Состояние обновляется по снимкам сервера.");
+}
+
+async function synchronizeJobSnapshot(jobId) {
+  if (state.jobSnapshotInProgress || !state.isBusy || state.jobId !== jobId) {
+    return;
+  }
+  state.jobSnapshotInProgress = true;
+  let result;
+  try {
+    result = await fetchJobSnapshot(jobId);
+  } catch (error) {
+    state.jobSnapshotInProgress = false;
+    reportJobSnapshotFailure(jobId, error);
+    return;
+  }
+  state.jobSnapshotInProgress = false;
+  if (!state.isBusy || state.jobId !== jobId) {
+    return;
+  }
+  if (result === null) {
+    beginJobUnlock(
+      jobId,
+      "Снимок задачи недоступен или уже удалён; интерфейс разблокирован.",
+      "Состояние задачи недоступно",
+      "Повторный запуск безопасен после проверки выходных файлов.",
+    );
+    return;
+  }
+  try {
+    applyJobSnapshot(result);
+  } catch (error) {
+    reportJobSnapshotFailure(jobId, error);
+    return;
+  }
+  state.jobSnapshotErrorShown = false;
+  if (result.completed) {
+    beginJobUnlock(jobId, completedJobMessage(result.status));
+    return;
+  }
+  reportRunningJobSnapshot();
+  scheduleJobSnapshotSync(jobId, JOB_SYNC_RETRY_DELAY_MS, state.jobSnapshotReason);
+}
+
+function handleJobStreamError(stream, jobId) {
+  if (state.eventSource !== stream || state.jobId !== jobId) {
+    return;
+  }
+  closeJobStream(stream);
+  appendLog("Поток событий оборвался; проверяю состояние задачи на сервере.");
+  setPickerHint("Связь с задачей прервана", "Интерфейс остаётся заблокированным до синхронизации.");
+  setTranslateBusy(true);
+  updateTranslateProgress();
+  scheduleJobSnapshotSync(jobId);
+}
+
+function scheduleJobAuthorityReconcile(jobId, delay = JOB_SYNC_RETRY_DELAY_MS) {
+  if (
+    state.jobAuthorityTimer !== null
+    || state.jobAuthorityInProgress
+    || !state.isBusy
+    || state.jobId !== jobId
+    || state.jobUnlockContext?.jobId !== jobId
+  ) {
+    return;
+  }
+  state.jobAuthorityTimer = setTimeout(() => {
+    state.jobAuthorityTimer = null;
+    reconcileJobAuthority(jobId);
+  }, delay);
+}
+
+function reportJobAuthorityFailure(jobId, error) {
+  if (!state.isBusy || state.jobId !== jobId || state.jobUnlockContext?.jobId !== jobId) {
+    return;
+  }
+  if (!state.jobAuthorityErrorShown) {
+    appendLog(`Не удалось проверить активную задачу: ${error.message}. Повторяю проверку.`);
+    setPickerHint("Проверяется активная задача", "Интерфейс остаётся заблокированным до ответа сервера.");
+    state.jobAuthorityErrorShown = true;
+  }
+  scheduleJobAuthorityReconcile(jobId);
+}
+
+function followAuthoritativeJob(result, previousJobId) {
+  applyJobSnapshot(result);
+  state.jobUnlockContext = null;
+  state.jobAuthorityErrorShown = false;
+  appendLogOnce(`Обнаружена новая активная задача ${result.job_id}; продолжаю синхронизацию.`);
+  setPickerHint("Переключено на активную задачу", `Задача ${previousJobId} завершена; отслеживается ${result.job_id}.`);
+  if (result.completed) {
+    beginJobUnlock(result.job_id, completedJobMessage(result.status));
+    return;
+  }
+  listenJob(result.job_id);
+}
+
+async function reconcileJobAuthority(jobId) {
+  if (state.jobAuthorityInProgress || !state.isBusy || state.jobId !== jobId) {
+    return;
+  }
+  state.jobAuthorityInProgress = true;
+  let result;
+  try {
+    result = await fetchActiveJobSnapshot();
+  } catch (error) {
+    state.jobAuthorityInProgress = false;
+    reportJobAuthorityFailure(jobId, error);
+    return;
+  }
+  state.jobAuthorityInProgress = false;
+  if (!state.isBusy || state.jobId !== jobId || state.jobUnlockContext?.jobId !== jobId) {
+    return;
+  }
+  if (!result.active) {
+    const context = state.jobUnlockContext;
+    releaseJobLock(context.message, context.hint, context.hintTitle);
+    return;
+  }
+  if (result.job_id === jobId) {
+    appendLogOnce("Завершённая задача ещё отмечена активной; повторяю проверку.");
+    scheduleJobAuthorityReconcile(jobId);
+    return;
+  }
+  try {
+    followAuthoritativeJob(result, jobId);
+  } catch (error) {
+    reportJobAuthorityFailure(jobId, error);
+  }
+}
+
+function scheduleActiveJobRetry() {
+  if (
+    state.activeJobRetryTimer !== null
+    || state.activeJobRetryInProgress
+    || !state.isBusy
+    || state.jobId
+  ) {
+    return;
+  }
+  state.activeJobRetryTimer = setTimeout(() => {
+    state.activeJobRetryTimer = null;
+    recoverConflictingJob();
+  }, JOB_SYNC_RETRY_DELAY_MS);
+}
+
+function activeJobRecoveryErrorPrefix(context) {
+  if (context === "startup") {
+    return "Не удалось проверить активную задачу при запуске";
+  }
+  if (context === "ambiguous") {
+    return "Не удалось проверить результат запуска";
+  }
+  return "Не удалось синхронизировать конфликт запуска";
+}
+
+function inactiveRecoveryMessage(context) {
+  if (context === "startup") {
+    return "";
+  }
+  if (context === "ambiguous") {
+    return "Активная задача после неоднозначного ответа запуска не найдена; интерфейс разблокирован.";
+  }
+  return "Активная задача после проверки конфликта запуска не найдена; интерфейс разблокирован.";
+}
+
+async function beginActiveJobRecovery(context) {
+  clearActiveJobRetryTimer();
+  state.activeJobRecoveryContext = context;
+  state.activeJobSyncErrorShown = false;
+  setTranslateBusy(true);
+  setPickerHint("Проверяется активная задача", "Интерфейс остаётся заблокированным до ответа сервера.");
+  await recoverConflictingJob();
+}
+
+async function recoverConflictingJob() {
+  if (state.activeJobRetryInProgress || !state.isBusy || state.jobId) {
+    return;
+  }
+  state.activeJobRetryInProgress = true;
+  const result = await loadActiveJob({ reportError: false });
+  state.activeJobRetryInProgress = false;
+  if (result.outcome === "active") {
+    state.activeJobRecoveryContext = null;
+    state.activeJobSyncErrorShown = false;
+    return;
+  }
+  if (!state.isBusy || state.jobId) {
+    return;
+  }
+  const context = state.activeJobRecoveryContext || "conflict";
+  if (result.outcome === "inactive") {
+    releaseJobLock(
+      inactiveRecoveryMessage(context),
+      context === "startup" ? DEFAULT_PICKER_HINT : "Активная задача не найдена",
+      context === "startup" ? "" : "Можно безопасно повторить запуск.",
+    );
+    return;
+  }
+  if (!state.activeJobSyncErrorShown) {
+    appendLog(`${activeJobRecoveryErrorPrefix(context)}: ${result.error.message}. Повторяю проверку.`);
+    setPickerHint("Проверяется активная задача", "Интерфейс остаётся заблокированным до ответа сервера.");
+    state.activeJobSyncErrorShown = true;
+  }
+  scheduleActiveJobRetry();
+}
+
+function listenJob(jobId) {
+  if (!JOB_ID_PATTERN.test(jobId)) {
+    releaseJobLock(
+      "Сервер вернул некорректный идентификатор задачи; восстановление невозможно.",
+      "Некорректный идентификатор задачи",
+    );
+    return;
+  }
+  clearJobSnapshotTimer();
+  clearJobAuthorityTimer();
+  closeJobStream();
   const streamUrl = new URL(`/api/stream/${encodeURIComponent(jobId)}`, window.location.origin);
   const stream = new EventSource(streamUrl);
-
-  stream.onmessage = (event) => {
-    if (!event.data) {
-      return;
-    }
-    let payload;
-    try {
-      payload = JSON.parse(event.data);
-    } catch {
-      appendLog("Получено повреждённое событие задачи.\n");
-      return;
-    }
-    if (payload.type === "log") {
-      appendLog(payload.message);
-      return;
-    }
-    if (payload.type === "job") {
-      state.jobTotal = payload.total;
-      updateTranslateProgress();
-      return;
-    }
-    if (payload.type === "file") {
-      updateFileState(payload.path, {
-        status: payload.state,
-        progress: payload.progress,
-        output: payload.output,
-        error: payload.error,
-      });
-      if (finalStates.has(payload.state) && !state.completed.has(payload.path)) {
-        state.completed.add(payload.path);
-        state.jobDone += 1;
-        updateTranslateProgress();
-      }
-      return;
-    }
-    if (payload.type === "done") {
-      const message = payload.status === "ok"
-        ? "Перевод завершён.\n"
-        : "Перевод завершён с ошибками.\n";
-      appendLog(message);
-      stream.close();
-      state.jobId = null;
-      setTranslateBusy(false);
-    }
-  };
-
-  stream.onerror = () => {
-    appendLog("Поток логов оборвался.\n");
-    stream.close();
-    state.jobId = null;
-    setTranslateBusy(false);
-  };
+  state.eventSource = stream;
+  stream.onmessage = (event) => handleJobStreamMessage(stream, event, jobId);
+  stream.onerror = () => handleJobStreamError(stream, jobId);
 }
 
 if (pickerFileBtn) {
@@ -923,9 +1847,6 @@ if (apiSelect) {
   apiSelect.addEventListener("change", () => {
     updateApiDependentUi();
     persistSettings();
-    refreshCache().catch((err) => {
-      appendLog(`Ошибка обновления: ${err.message}`);
-    });
   });
 }
 
@@ -937,7 +1858,12 @@ if (sourceLangSelect) {
     const fallback = state.uiConfig?.defaults?.target_lang || "ru";
     setTargetLanguageOptions(profile, languageConfig, fallback);
     persistSettings();
-    refreshDebounced();
+  });
+}
+
+if (refreshBtn) {
+  refreshBtn.addEventListener("click", () => {
+    refreshCache().catch(reportRefreshError);
   });
 }
 
@@ -954,6 +1880,7 @@ if (unloadBtn) {
 }
 
 clearLogs.addEventListener("click", () => {
+  state.logLines = [];
   logConsole.textContent = "";
 });
 
@@ -1023,12 +1950,6 @@ if (smartSplitModal) {
   });
 }
 
-const refreshDebounced = debounce(() => {
-  refreshCache().catch((err) => {
-    appendLog(`Ошибка обновления: ${err.message}`);
-  });
-}, 450);
-
 settingsForm.addEventListener("input", (event) => {
   const target = event.target;
   if (target instanceof HTMLElement && target.classList.contains("prompt-area")) {
@@ -1041,15 +1962,43 @@ settingsForm.addEventListener("input", (event) => {
     updateSmartSplitStatus();
   }
   persistSettings();
-  refreshDebounced();
+});
+
+function clientErrorMessage(value) {
+  if (value instanceof Error && value.message) {
+    return value.message;
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+  return "причина не указана";
+}
+
+window.addEventListener("error", (event) => {
+  const message = clientErrorMessage(event.error || event.message);
+  appendLog(`Необработанная ошибка интерфейса: ${message}`);
+  setPickerHint("Ошибка интерфейса", message);
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  const message = clientErrorMessage(event.reason);
+  appendLog(`Необработанная ошибка операции: ${message}`);
+  setPickerHint("Ошибка операции", message);
+});
+
+window.addEventListener("beforeunload", () => {
+  abortItemRequest();
+  clearJobSnapshotTimer();
+  clearActiveJobRetryTimer();
+  clearJobAuthorityTimer();
+  closeJobStream();
 });
 
 setTranslateBusy(false);
 
-try {
-  await loadUiConfig();
-  await loadActiveJob();
-} catch (err) {
+const uiConfigPromise = loadUiConfig().catch((err) => {
   appendLog(`Ошибка загрузки настроек UI: ${err.message}`);
   updateApiDependentUi();
-}
+});
+await beginActiveJobRecovery("startup");
+await uiConfigPromise;
