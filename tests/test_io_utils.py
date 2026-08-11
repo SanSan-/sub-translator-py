@@ -37,6 +37,32 @@ def test_atomic_write_text_preserves_existing_file_when_replace_fails(
     assert list(tmp_path.glob(".*.tmp")) == []
 
 
+def test_atomic_write_text_retries_temporary_windows_file_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "usage.json"
+    output.write_text("OLD", encoding="utf-8")
+    real_replace = os.replace
+    attempts = 0
+
+    def replace_after_temporary_lock(source: Path, target: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(13, "Файл временно занят")
+        real_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", replace_after_temporary_lock)
+    monkeypatch.setattr(io_utils.time, "sleep", lambda _seconds: None)
+
+    io_utils.atomic_write_text(output, "NEW")
+
+    assert attempts == 3
+    assert output.read_text(encoding="utf-8") == "NEW"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
 def test_atomic_write_text_refuses_overwrite(tmp_path: Path) -> None:
     output = tmp_path / "result.srt"
     output.write_text("OWNER", encoding="utf-8")

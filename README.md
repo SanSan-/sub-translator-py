@@ -699,8 +699,8 @@ uv pip check
 
 ```powershell
 uv lock --check
-uv run --frozen pytest -p no:cacheprovider -q
-uv run --frozen pytest -p no:cacheprovider -q `
+uv run --frozen python -m pytest -p no:cacheprovider -q
+uv run --frozen python -m pytest -p no:cacheprovider -q `
   --cov=sub_translate --cov-branch --cov-report=term-missing --cov-report=xml:coverage.xml
 uv run --frozen ruff check .
 uv run --frozen ruff format --check .

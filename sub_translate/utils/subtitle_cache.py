@@ -29,7 +29,7 @@ from sub_translate.utils.validation_utils import (
 
 OUTPUT_CACHE_SCHEMA_VERSION = 3
 OUTPUT_CACHE_TYPE = "translated-subtitle-output"
-OUTPUT_CACHE_ALGORITHM_VERSION = "subtitle-output-v3"
+OUTPUT_CACHE_ALGORITHM_VERSION = "subtitle-output-v4"
 DEFAULT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_CACHE_MAX_ENTRIES = 512
 DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS = 60.0

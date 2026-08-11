@@ -172,6 +172,37 @@ def test_srt_preserves_source_order_and_duplicate_identifiers() -> None:
     ]
 
 
+def test_srt_normalizes_physical_line_breaks_returned_inside_one_translation() -> None:
+    origins = [
+        "27",
+        "00:01:00,000 --> 00:01:04,000",
+        "Furthermore, because mail-serve1 is detected",
+        "with the internal IP address address of",
+        "",
+    ]
+    dialogs = parse_srt_dialogs(origins)
+    translated = [
+        TranslatedItem(
+            idx=0,
+            text="Кроме того, поскольку mail-serve1 обнаружен с внутренним IP-адресом\nадресом\nof",
+            lines=[27],
+        )
+    ]
+
+    restored = build_translated_dialogs(translated, analyse_lines(dialogs))
+    exported = build_export_lines(origins, FileFormat.SRT.value, dialogs, restored)
+
+    assert exported == [
+        "27",
+        "00:01:00,000 --> 00:01:04,000",
+        "Кроме того,",
+        "поскольку mail-serve1 обнаружен с внутренним IP-адресом адресом of",
+        "",
+    ]
+    assert all("\r" not in line and "\n" not in line for line in exported)
+    assert validate_cached_lines(exported, FileFormat.SRT)
+
+
 def test_vtt_preserves_header_identifier_timing_and_cue_settings() -> None:
     timing = "00:00.000 --> 00:02.500 line:10%,start position:20%,line-left size:35% align:start vertical:rl"
     origins = [

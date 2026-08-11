@@ -63,6 +63,7 @@ _SENTENCE_SPACE_QE_MASK = re.compile(r"([!?])(?=[\"')\]]?[A-Z\u0410-\u042F\u0401
 _SENTENCE_SKIP_CHARS = {'"', "'", ")", "]"}
 _SENTENCE_START_SKIP_CHARS = {'"', "'", "(", ")", "[", "]", "{", "}", "«", "»", "-", "—", "–"}
 _COMMA_CHARS = {",", "，"}
+_PHYSICAL_LINE_BREAKS = str.maketrans({"\r": SPACE_SIGN, "\n": SPACE_SIGN})
 
 
 def _is_inside_parentheses(text: str, pos: int) -> bool:
@@ -221,7 +222,8 @@ def format_line(line: str, dictionary: list[dict[str, str]]) -> str:
 
 
 def clean_line(text: str) -> str:
-    temp = replace_all(format_line(text, BAD_SYMBOLS), NO_SPACE_NEXT_LINE_MASK, FIRST_GROUP)
+    normalized = str(text).translate(_PHYSICAL_LINE_BREAKS)
+    temp = replace_all(format_line(normalized, BAD_SYMBOLS), NO_SPACE_NEXT_LINE_MASK, FIRST_GROUP)
     temp = NEXT_LINE_MASK.sub(SPACE_SIGN, temp)
     temp = DRAW_MASK.sub(EMPTY_STRING, temp)
     temp = ASS_EFFECTS_MASK.sub(EMPTY_STRING, temp)

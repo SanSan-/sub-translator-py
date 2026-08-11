@@ -102,7 +102,7 @@ def test_same_basename_with_different_content_has_distinct_fingerprint(tmp_path:
         ("model_revision", "revision-2"),
         ("model_content_fingerprint", "a" * 64),
         ("prompts", {"system": prompt_signature("Другая подсказка")}),
-        ("algorithm_version", "subtitle-output-v4"),
+        ("algorithm_version", "subtitle-output-v5"),
         ("source_language", "de"),
         ("target_language", "ja"),
         ("translator_id", "other-translator"),

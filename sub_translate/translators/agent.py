@@ -681,14 +681,21 @@ def _apply_usage(usage, logger: logging.Logger) -> None:
         session_total_tokens,
         session_cost,
     )
-    with _usage_lock:
-        totals = record_usage(
-            source="agent_translator",
-            model=MODEL_NAME,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=cost_increment or 0.0,
+    try:
+        with _usage_lock:
+            totals = record_usage(
+                source="agent_translator",
+                model=MODEL_NAME,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost_increment or 0.0,
+            )
+    except OSError as exc:
+        logger.warning(
+            "Не удалось сохранить статистику использования агента (тип ошибки: %s).",
+            type(exc).__name__,
         )
+        return
     log_usage_summary(
         logger,
         totals,

@@ -267,6 +267,26 @@ def test_openai_initialization_error_does_not_expose_api_key(
     assert caught.value.__cause__ is None
 
 
+def test_usage_persistence_error_does_not_discard_successful_response(monkeypatch, caplog) -> None:
+    logger = logging.getLogger("agent-usage-persistence-test")
+    usage = SimpleNamespace(input_tokens=12, output_tokens=8, total_tokens=20)
+    response = SimpleNamespace(output_text="Готовый перевод", usage=usage)
+    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_kwargs: response))
+
+    def fail_record_usage(**_kwargs) -> None:
+        raise PermissionError(13)
+
+    monkeypatch.setattr(agent, "record_usage", fail_record_usage)
+    monkeypatch.setattr(agent, "ensure_translator_ready", lambda: None)
+    monkeypatch.setattr(agent, "_client", client)
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        result = agent._request_translation("Служебная подсказка", None, logger)
+
+    assert result == "Готовый перевод"
+    assert "Не удалось сохранить статистику использования агента (тип ошибки: PermissionError)." in caplog.text
+
+
 def test_prompt_cache_metadata_contains_only_signatures(tmp_path, monkeypatch) -> None:
     cache_path = tmp_path / "prompt-cache.json"
     system_prompt = "секретная системная подсказка"
