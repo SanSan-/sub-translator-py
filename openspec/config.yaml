@@ -1,0 +1,18 @@
+schema: spec-driven
+
+context: |
+  Продукт: локальный переводчик ASS/SRT/WebVTT через явно выбранные профили.
+  Стек и версии: pyproject.toml, uv.lock, .python-version; модельные среды из реестра.
+  Первый файл: openspec/context/00-start-here.md; остальные документы по его маршруту.
+  Контракты: subtitle-translation, model-runtime, local-web.
+  Инженерные ограничения: engineering-governance; команды — reference/project-specific.md этой capability.
+  Архитектурные решения: openspec/context/ADR/README.md.
+rules:
+  proposal:
+    - Укажи цель пользователя, границы изменения и затронутые возможности переводчика.
+  specs:
+    - Сохраняй предметные контракты, ограничения безопасности и проверяемые сценарии.
+  design:
+    - Обоснуй проектный выбор и свяжи его с требованиями и применимыми ADR.
+  tasks:
+    - Сохраняй открытую работу и применимые проектные проверки с их фактическими статусами.
