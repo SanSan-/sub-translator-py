@@ -28,7 +28,14 @@ from sub_translate.translators.registry import (
     resolve_registered_model,
     resolve_translator_id,
 )
-from sub_translate.utils.io_utils import read_text, split_lines, write_lines
+from sub_translate.utils.io_utils import (
+    read_text,
+    resolve_output_path,
+    split_lines,
+    validate_distinct_files,
+    validate_subtitle_output,
+    write_lines,
+)
 from sub_translate.utils.line_utils import (
     analyse_lines,
     build_export_lines,
@@ -170,7 +177,7 @@ def resolve_io_paths(
     resolved_source = suffix_lang or source_lang
     resolved_target = get_code(target_lang) or target_lang
     if output_arg:
-        return resolved_source, Path(output_arg).expanduser().resolve()
+        return resolved_source, resolve_output_path(Path(output_arg))
     output_stem = f"{base_stem}.{api}.{resolved_target}"
     return resolved_source, resolved_input.with_name(f"{output_stem}.{file_format.value}")
 
@@ -297,7 +304,6 @@ def translate_subtitles(
     output_path: Path,
     file_format: FileFormat,
     options: TranslationOptions,
-    api: str,
     *,
     thread_count: int,
     batch_size: int,
@@ -307,15 +313,21 @@ def translate_subtitles(
     logger: logging.Logger,
     progress_callback: FileProgressCallback | None = None,
     overwrite: bool = True,
+    cache_path: Path | None = None,
 ) -> None:
     """Переводит один файл после решения вопросов путей, кеша и перезаписи вызывающим кодом."""
+    output_path = resolve_output_path(output_path)
+    protected_paths = (input_path.expanduser().resolve(),)
+    if cache_path is not None:
+        protected_paths += (cache_path.expanduser().resolve(),)
+    validate_subtitle_output(output_path, protected_paths=protected_paths)
     origins = split_lines(read_text(input_path))
     dialogs = _parse_dialogs(origins, file_format)
     prepare = build_prepare(dialogs, smart_split, smart_split_settings)
     analysis = analyse_lines(dialogs)
 
-    translator_metadata = get_translator_metadata(api)
-    translator = get_translator(api, timeout)
+    translator_metadata = get_translator_metadata(options.api)
+    translator = get_translator(options.api, timeout)
     translated_items = _translate_batches(
         prepare,
         translator,
@@ -330,7 +342,7 @@ def translate_subtitles(
     export_lines = build_export_lines(origins, file_format.value, dialogs, translated_dialogs)
     if not validate_cached_lines(export_lines, file_format):
         raise TranslationError("Сформированный файл субтитров не прошёл проверку структуры.")
-    write_lines(output_path, export_lines, overwrite=overwrite)
+    write_lines(output_path, export_lines, overwrite=overwrite, protected_paths=protected_paths)
 
 
 def _translation_options(settings: ProcessingSettings, source_lang: str) -> TranslationOptions:
@@ -468,8 +480,9 @@ def process_subtitle(
         settings.api,
         file_format,
     )
-    if resolved_output == resolved_input:
-        raise ValueError("Исходный и выходной пути не должны совпадать.")
+    resolved_cache = Path(cache_path).expanduser().resolve()
+    validate_subtitle_output(resolved_output, protected_paths=(resolved_input, resolved_cache))
+    validate_distinct_files(resolved_cache, protected_paths=(resolved_input,))
     identity = build_output_cache_identity(
         resolved_input,
         file_format,
@@ -499,7 +512,6 @@ def process_subtitle(
         resolved_output,
         file_format,
         _translation_options(settings, source_lang),
-        settings.api,
         thread_count=settings.thread_count,
         batch_size=settings.batch_size,
         smart_split=settings.smart_split,
@@ -508,6 +520,7 @@ def process_subtitle(
         logger=logger,
         progress_callback=progress_callback,
         overwrite=settings.force,
+        cache_path=resolved_cache,
     )
     current_identity = build_output_cache_identity(
         resolved_input,

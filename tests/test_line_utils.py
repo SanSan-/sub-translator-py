@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -131,6 +133,52 @@ def test_clean_line_sentence_spacing_questions() -> None:
 
 def test_clean_line_sentence_spacing_questions_en() -> None:
     assert clean_line("What?No!") == "What? No!"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("A?A!A", "A? A! A"),
+        ("А?А!Ё", "А? А! Ё"),
+        ("A?\"A!'A", "A? \"A! 'A"),
+        ("A?]A!A", "A? ]A! A"),
+        ("A?A.A!A", "A? A. A! A"),
+        ("(A?A)", "(A?A)"),
+        ("((A?A)!A)", "((A?A)! A)"),
+        ("(A(B?B)A!A)", "(A(B?B)A!A)"),
+        ("(A?\"A!'A)", "(A?\"A!'A)"),
+        ("(А?А!Ё)", "(А? А! Ё)"),
+        ("(A?А!A)", "(A? А! A)"),
+        ("(A?A", "(A?A"),
+        ("A?A)", "A? A)"),
+        (")(A?A", ")(A? A"),
+        ("))((A?A!A", "))((A? A! A"),
+        ("))(((A?A!A", "))(((A?A!A"),
+        ("(A?A)B!B", "(A?A)B! B"),
+        ("?A!A", "? A! A"),
+        ("A?lower!lower", "A?lower!lower"),
+    ],
+)
+def test_clean_line_sentence_spacing_preserves_parenthesis_balance(source: str, expected: str) -> None:
+    assert clean_line(source) == expected
+
+
+def test_clean_line_dense_punctuation_completes_in_bounded_process() -> None:
+    code = (
+        "from sub_translate.utils.line_utils import clean_line\n"
+        "source = 'A?A!A' * 200000\n"
+        "assert len(source) == 1000000\n"
+        "assert clean_line(source) == 'A? A! A' * 200000\n"
+    )
+    subprocess.run(
+        [sys.executable, "-B", "-X", "utf8", "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
+    )
 
 
 def test_clean_line_non_breaking_hyphen() -> None:

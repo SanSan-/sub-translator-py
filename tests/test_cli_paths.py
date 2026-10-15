@@ -55,6 +55,69 @@ def test_resolve_io_paths_respects_output_arg(tmp_path: Path) -> None:
     assert output_path == output_arg.resolve()
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_resolve_io_paths_preserves_output_link_name(tmp_path: Path, explicit: bool) -> None:
+    source = tmp_path / "source.en.srt"
+    output = tmp_path / "source.google.ru.srt"
+    target = tmp_path / "target.srt"
+    try:
+        output.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Символические ссылки недоступны: {exc}")
+
+    _, resolved = resolve_io_paths(source, output if explicit else None, "en", "ru", "google", FileFormat.SRT)
+
+    assert resolved == output
+    assert resolved != target
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("alias", ["source_symlink", "other_symlink", "missing_symlink", "source_hardlink"])
+def test_main_rejects_output_alias_before_running_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    force: bool,
+    explicit: bool,
+    alias: str,
+) -> None:
+    source = tmp_path / "source.en.srt"
+    other = tmp_path / "other.srt"
+    output = tmp_path / "source.google.ru.srt"
+    missing = tmp_path / "missing.srt"
+    source.write_text("SOURCE", encoding="utf-8")
+    other.write_text("OTHER", encoding="utf-8")
+    targets = {"source": source, "other": other, "missing": missing}
+    target_name, link_type = alias.split("_")
+    try:
+        if link_type == "hardlink":
+            output.hardlink_to(targets[target_name])
+        else:
+            output.symlink_to(targets[target_name])
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Ссылки недоступны: {exc}")
+    arguments = ["sub-translate", "--input", str(source), "--api", "google"]
+    if explicit:
+        arguments.extend(["--output", str(output)])
+    if force:
+        arguments.append("--force")
+    run_service = Mock(side_effect=AssertionError("обработка не должна начинаться"))
+    monkeypatch.setattr(sys, "argv", arguments)
+    monkeypatch.setattr(cli, "load_env", lambda: None)
+    monkeypatch.setattr(cli, "process_subtitle", run_service)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == cli.EXIT_USAGE_ERROR
+    assert "Traceback" not in capsys.readouterr().err
+    assert source.read_text(encoding="utf-8") == "SOURCE"
+    assert other.read_text(encoding="utf-8") == "OTHER"
+    assert not missing.exists()
+    run_service.assert_not_called()
+
+
 def test_parser_lists_translategemma() -> None:
     help_text = build_parser().format_help()
 

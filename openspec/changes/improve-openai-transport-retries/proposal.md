@@ -29,5 +29,4 @@ APIConnectionError и совместная политика повторов SDK
 
 ## Impact
 
-Рабочий вход — sub_translate/translators/agent.py::_request_translation; текущий статус NOT_RUN, все четыре задачи
-открыты.
+Рабочий вход — `sub_translate/translators/agent.py::_request_translation`.

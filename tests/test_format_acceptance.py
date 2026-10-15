@@ -275,7 +275,7 @@ def test_mismatched_translator_response_does_not_publish_output(
     _write_source_srt(source)
     monkeypatch.setattr(service, "get_translator", lambda *_args: _BrokenTranslator([]))
     monkeypatch.setattr(service, "get_translator_metadata", lambda *_args: SimpleNamespace(thread_safe=True))
-    options = TranslationOptions(source_lang="en", target_lang="ru")
+    options = TranslationOptions(source_lang="en", target_lang="ru", api="broken")
 
     with pytest.raises(TranslationError, match="не совпадает с размером пачки"):
         service.translate_subtitles(
@@ -283,7 +283,6 @@ def test_mismatched_translator_response_does_not_publish_output(
             output,
             FileFormat.SRT,
             options,
-            "broken",
             thread_count=1,
             batch_size=1,
             smart_split=False,
@@ -304,7 +303,7 @@ def test_invalid_translator_text_preserves_existing_output_atomically(
     output.write_text("результат владельца", encoding="utf-8", newline="")
     monkeypatch.setattr(service, "get_translator", lambda *_args: _BrokenTranslator([""]))
     monkeypatch.setattr(service, "get_translator_metadata", lambda *_args: SimpleNamespace(thread_safe=True))
-    options = TranslationOptions(source_lang="en", target_lang="ru")
+    options = TranslationOptions(source_lang="en", target_lang="ru", api="broken")
 
     with pytest.raises(TranslationError, match="пустой перевод для непустого элемента"):
         service.translate_subtitles(
@@ -312,7 +311,6 @@ def test_invalid_translator_text_preserves_existing_output_atomically(
             output,
             FileFormat.SRT,
             options,
-            "broken",
             thread_count=1,
             batch_size=1,
             smart_split=False,

@@ -66,12 +66,7 @@ _COMMA_CHARS = {",", "，"}
 _PHYSICAL_LINE_BREAKS = str.maketrans({"\r": SPACE_SIGN, "\n": SPACE_SIGN})
 
 
-def _is_inside_parentheses(text: str, pos: int) -> bool:
-    segment = text[:pos]
-    return segment.count("(") > segment.count(")")
-
-
-def _should_insert_qe_space(text: str, pos: int) -> bool:
+def _should_insert_qe_space(text: str, pos: int, parentheses_balance: int) -> bool:
     if pos <= 0:
         return True
     prev_char = text[pos - 1]
@@ -82,15 +77,25 @@ def _should_insert_qe_space(text: str, pos: int) -> bool:
         return False
     next_char = text[next_idx]
     if prev_char.isascii() and prev_char.isalpha() and next_char.isascii() and next_char.isalpha():
-        return not _is_inside_parentheses(text, pos)
+        return parentheses_balance <= 0
     return True
 
 
 def _ensure_sentence_spacing(text: str) -> str:
     temp = _SENTENCE_SPACE_DOT_MASK.sub(r"\1 ", text)
+    scan_position = 0
+    parentheses_balance = 0
 
     def _replace_qe(match: re.Match[str]) -> str:
-        if _should_insert_qe_space(match.string, match.start()):
+        nonlocal scan_position, parentheses_balance
+        while scan_position < match.start():
+            char = temp[scan_position]
+            if char == "(":
+                parentheses_balance += 1
+            elif char == ")":
+                parentheses_balance -= 1
+            scan_position += 1
+        if _should_insert_qe_space(match.string, match.start(), parentheses_balance):
             return f"{match.group(1)} "
         return match.group(1)
 

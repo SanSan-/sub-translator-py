@@ -21,6 +21,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sub_translate import __version__
 from sub_translate.constants import (
@@ -99,6 +101,28 @@ class _SubtitlePreparationError(ValueError):
 MAX_STORED_JOBS = 32
 MAX_EVENTS_PER_JOB = 512
 TERMINAL_JOB_TTL_SECONDS = 15 * 60
+
+
+class _AntiFramingHeaders:
+    """Добавляет политику снаружи обработчиков ошибок и не буферизует ответы."""
+
+    def __init__(self, application: ASGIApp) -> None:
+        self.application = application
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.application(scope, receive, send)
+            return
+
+        async def send_with_policy(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+                headers["X-Frame-Options"] = "DENY"
+            await send(message)
+
+        await self.application(scope, receive, send_with_policy)
+
 
 app = FastAPI(title="Sub Translator", version=__version__)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -248,9 +272,16 @@ class TranslationSettings(StrictRequestModel):
     def validate_tld(cls, value: object) -> str:
         return normalize_google_tld(value)
 
-    @field_validator("model_path", "model_revision", "worker_python_path", mode="before")
+    @field_validator(
+        "model_path",
+        "model_revision",
+        "worker_python_path",
+        "agent_system_prompt_file",
+        "agent_prompt_file",
+        mode="before",
+    )
     @classmethod
-    def normalize_optional_model_value(cls, value: object) -> object:
+    def normalize_optional_value(cls, value: object) -> object:
         if not isinstance(value, str):
             return value
         normalized = value.strip()
@@ -1419,3 +1450,7 @@ def stream(job_id: str) -> StreamingResponse:
                 break
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+fastapi_app = app
+app = _AntiFramingHeaders(fastapi_app)

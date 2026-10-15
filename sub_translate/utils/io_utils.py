@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
+from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -39,43 +42,107 @@ def split_lines(text: str) -> list[str]:
 
 
 def _output_lock_path(path: Path) -> Path:
-    normalized = str(path.expanduser().resolve()).casefold().encode("utf-8")
+    normalized = str(path).casefold().encode("utf-8")
     digest = hashlib.sha256(normalized).hexdigest()
     return CACHE_DIR / "output-locks" / f"{digest}.lock"
 
 
-def _replace_with_retry(source: Path, target: Path) -> None:
+def resolve_output_path(path: Path) -> Path:
+    """Разрешает родителя, сохраняя конечное имя без перехода по ссылке."""
+    expanded = path.expanduser()
+    return expanded.parent.resolve() / expanded.name
+
+
+def validate_distinct_files(path: Path, *, protected_paths: Sequence[Path]) -> None:
+    """Отклоняет совпадение путей и доступных файлов, не подменяя обработку ошибок ввода-вывода."""
+    for protected in protected_paths:
+        if path == protected:
+            raise ValueError("Выходной и защищённый пути не должны совпадать.")
+        try:
+            same_file = path.samefile(protected)
+        except OSError:
+            continue
+        if same_file:
+            raise ValueError("Выходной и защищённый пути не должны совпадать.")
+
+
+def validate_subtitle_output(path: Path, *, protected_paths: Sequence[Path] = ()) -> None:
+    """Проверяет нормализованное назначение и файловую идентичность защищённых путей."""
+    try:
+        destination_stat = path.lstat()
+    except FileNotFoundError:
+        destination_stat = None
+    if destination_stat is not None:
+        attributes = getattr(destination_stat, "st_file_attributes", 0)
+        if stat.S_ISLNK(destination_stat.st_mode) or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("Выходной файл не должен быть ссылкой или точкой повторной обработки.")
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise ValueError("Выходной путь должен указывать на обычный файл.")
+    validate_distinct_files(path, protected_paths=protected_paths)
+
+
+def _replace_with_retry(source: Path, target: Path, check_target: Callable[[], None]) -> None:
     """Повторяет атомарную замену при краткой блокировке файла в Windows."""
     for attempt in range(_ATOMIC_REPLACE_ATTEMPTS):
+        check_target()
         try:
             os.replace(source, target)
             return
         except PermissionError:
-            if attempt + 1 >= _ATOMIC_REPLACE_ATTEMPTS:
+            attempt_number = attempt + 1
+            if attempt_number >= _ATOMIC_REPLACE_ATTEMPTS:
                 raise
-            time.sleep(_ATOMIC_REPLACE_DELAY_SECONDS * (attempt + 1))
+            time.sleep(_ATOMIC_REPLACE_DELAY_SECONDS * attempt_number)
 
 
-def atomic_write_text(path: Path, content: str, *, overwrite: bool = True) -> None:
-    """Атомарно записывает UTF-8 без BOM под межпроцессной блокировкой."""
-    resolved = path.expanduser().resolve()
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = _output_lock_path(resolved)
+def _check_write_target(path: Path, overwrite: bool, protected_paths: Sequence[Path] | None) -> None:
+    if protected_paths is not None:
+        validate_subtitle_output(path, protected_paths=protected_paths)
+    if not overwrite and path.exists():
+        raise FileExistsError(f"Файл уже существует: {path}")
+
+
+def _atomic_write_text(
+    path: Path,
+    content: str,
+    *,
+    overwrite: bool,
+    protected_paths: Sequence[Path] | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _output_lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    check_target = partial(_check_write_target, path, overwrite, protected_paths)
     with FileLock(lock_path, timeout=60):
-        if not overwrite and resolved.exists():
-            raise FileExistsError(f"Файл уже существует: {resolved}")
-        temporary = resolved.with_name(f".{resolved.name}.{uuid4().hex}.tmp")
+        check_target()
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         try:
             with temporary.open("x", encoding="utf-8", newline="") as file:
                 file.write(content)
                 file.flush()
                 os.fsync(file.fileno())
-            if not overwrite and resolved.exists():
-                raise FileExistsError(f"Файл уже существует: {resolved}")
-            _replace_with_retry(temporary, resolved)
+            _replace_with_retry(temporary, path, check_target)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: Path, content: str, *, overwrite: bool = True) -> None:
+    """Атомарно записывает UTF-8 без BOM под межпроцессной блокировкой."""
+    _atomic_write_text(path.expanduser().resolve(), content, overwrite=overwrite)
+
+
+def publish_subtitle_text(
+    path: Path,
+    content: str,
+    *,
+    overwrite: bool = True,
+    protected_paths: Sequence[Path] = (),
+) -> None:
+    """Публикует субтитры без разрешения конечной ссылки, сохраняя защищённые файлы."""
+    destination = resolve_output_path(path)
+    protected = tuple(item.expanduser().resolve() for item in protected_paths)
+    validate_subtitle_output(destination, protected_paths=protected)
+    _atomic_write_text(destination, content, overwrite=overwrite, protected_paths=protected)
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -83,16 +150,26 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     atomic_write_text(path, content)
 
 
-def write_lines(path: Path, lines: list[str], *, overwrite: bool = True) -> None:
+def write_lines(
+    path: Path,
+    lines: list[str],
+    *,
+    overwrite: bool = True,
+    protected_paths: Sequence[Path] = (),
+) -> None:
     content = HARD_NEW_LINE_SIGN.join(lines)
-    atomic_write_text(path, content, overwrite=overwrite)
+    publish_subtitle_text(path, content, overwrite=overwrite, protected_paths=protected_paths)
 
 
 __all__ = [
     "atomic_write_json",
     "atomic_write_text",
     "configure_utf8_stdio",
+    "publish_subtitle_text",
     "read_text",
+    "resolve_output_path",
     "split_lines",
+    "validate_distinct_files",
+    "validate_subtitle_output",
     "write_lines",
 ]

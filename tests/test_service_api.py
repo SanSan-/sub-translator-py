@@ -13,6 +13,7 @@ from sub_translate.service import (
     resolve_api,
 )
 from sub_translate.translators.base import TranslationError
+from sub_translate.utils import io_utils
 
 LOGGER = logging.getLogger("test.service")
 
@@ -223,3 +224,120 @@ def test_process_subtitle_batch_isolates_file_error(tmp_path: Path, monkeypatch)
     ]
     assert completed == [ProcessingStatus.ERROR, ProcessingStatus.TRANSLATED]
     assert (tmp_path / "valid.google.ru.srt").exists()
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize(
+    "alias", ["source_symlink", "other_symlink", "missing_symlink", "source_hardlink", "cache_hardlink"]
+)
+def test_process_subtitle_rejects_output_alias_before_translation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force: bool,
+    explicit: bool,
+    alias: str,
+) -> None:
+    source = tmp_path / "source.en.srt"
+    other = tmp_path / "other.srt"
+    missing = tmp_path / "missing.srt"
+    output = tmp_path / "source.google.ru.srt"
+    cache_path = tmp_path / "cache.json"
+    write_srt(source)
+    write_srt(other, "Другой файл")
+    cache_path.write_text('{"keep": true}', encoding="utf-8")
+    original = {path: path.read_bytes() for path in (source, other, cache_path)}
+    targets = {"source": source, "other": other, "missing": missing, "cache": cache_path}
+    target_name, link_type = alias.split("_")
+    try:
+        if link_type == "hardlink":
+            output.hardlink_to(targets[target_name])
+        else:
+            output.symlink_to(targets[target_name])
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Ссылки недоступны: {exc}")
+    translator = FakeTranslator()
+    monkeypatch.setattr(service, "get_translator", lambda *_args: translator)
+    monkeypatch.setattr(io_utils, "CACHE_DIR", tmp_path / "locks")
+
+    settings = ProcessingSettings(source_lang="en", target_lang="ru", api="google", force=force)
+    with pytest.raises(ValueError):
+        process_subtitle(
+            source,
+            settings,
+            logger=LOGGER,
+            output_path=output if explicit else None,
+            cache_path=cache_path,
+        )
+
+    assert {path: path.read_bytes() for path in original} == original
+    assert not missing.exists()
+    assert translator.calls == []
+
+
+def test_process_subtitle_rejects_link_created_during_translation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.en.srt"
+    output = tmp_path / "source.google.ru.srt"
+    cache_path = tmp_path / "cache.json"
+    write_srt(source)
+    original = source.read_bytes()
+    try:
+        output.symlink_to(source)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Символические ссылки недоступны: {exc}")
+    output.unlink()
+    translator = FakeTranslator()
+    translate_batch = translator.translate_batch
+
+    def substitute_output(texts, options):
+        output.symlink_to(source)
+        return translate_batch(texts, options)
+
+    monkeypatch.setattr(translator, "translate_batch", substitute_output)
+    monkeypatch.setattr(service, "get_translator", lambda *_args: translator)
+    monkeypatch.setattr(io_utils, "CACHE_DIR", tmp_path / "locks")
+
+    settings = ProcessingSettings(api="google", force=True)
+    with pytest.raises(ValueError, match="не должен быть ссылкой"):
+        process_subtitle(
+            source,
+            settings,
+            logger=LOGGER,
+            cache_path=cache_path,
+        )
+
+    assert source.read_bytes() == original
+    assert not cache_path.exists()
+    assert len(translator.calls) == 1
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_process_subtitle_ignores_unreadable_cache_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force: bool,
+) -> None:
+    source = tmp_path / "source.en.srt"
+    cache_path = tmp_path / "cache.json"
+    cache_path.mkdir()
+    write_srt(source)
+    original = source.read_bytes()
+    translator = FakeTranslator()
+    monkeypatch.setattr(service, "get_translator", lambda *_args: translator)
+    monkeypatch.setattr(io_utils, "CACHE_DIR", tmp_path / "locks")
+
+    result = process_subtitle(
+        source,
+        ProcessingSettings(api="google", force=force),
+        logger=LOGGER,
+        cache_path=cache_path,
+    )
+
+    assert result.status is ProcessingStatus.TRANSLATED
+    assert result.output_path.read_text(encoding="utf-8").endswith("Перевод 1\n")
+    assert source.read_bytes() == original
+    assert cache_path.is_dir()
+    assert list(cache_path.iterdir()) == []

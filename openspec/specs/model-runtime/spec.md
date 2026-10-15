@@ -10,7 +10,7 @@
 ### Requirement: MODEL-001 Реестр и совместимость
 
 Публичный реестр SHALL содержать google, agent, nllb-600m, translategemma, translategemma-12b, seedx; алиасы разрешаются
-в одном месте. Идентичность модели, закреплённая ревизия, путь, состав файлов, языки, лицензия, источник и требования к
+в одном месте. Идентичность модели, закреплённая ревизия, путь по умолчанию, состав файлов, языки, лицензия, источник и требования к
 среде SHALL определяться [реестром](../../../sub_translate/translators/registry.py). Листинг MUST обходиться без загрузки
 адаптеров и весов; неизвестный или удалённый профиль отклоняется. Старые модельные каталоги не удаляются автоматически;
 прежний каталог Seed-X AWQ не используется новым профилем.
@@ -109,9 +109,9 @@ HUGGINGFACE_TOKEN, и не попадать в отметку или цепоч�
 ### Requirement: MODEL-009 Очистка Seed-X
 
 Seed-X SHALL распознавать граничную target-метку с учётом регистра/пробелов и отклонять встроенную повторную метку или
-остаток подсказки. Очистка MUST удалять только сгенерированную разметку/искажённые теги/чужие URL и связанный
-Source-хвост, сохраняя точную квоту исходных тегов/URL, Unicode, сравнения и повторы. Число непустых строк не
-увеличивается; пустой ответ отклоняется.
+остаток подсказки. Очистка MUST удалять только сгенерированную разметку/искажённые теги/чужие URL (`http`, `https`,
+`ftp`, `www`) и связанный Source-хвост, сохраняя точную квоту исходных тегов/URL, Unicode, сравнения и повторы.
+После очистки число непустых строк результата не превышает числа строк исходного текста; пустой ответ отклоняется.
 
 #### Scenario: Очистка Seed-X
 
@@ -119,14 +119,24 @@ Source-хвост, сохраняя точную квоту исходных т�
 - **THEN** исходные элементы сохраняются в своей квоте; добавленная ссылка удаляется; частичный пустой результат не
   публикуется.
 
+#### Scenario: Лишний перенос без разметки
+
+- **GIVEN** исходный текст содержит одну строку, а ответ модели — две непустые строки без разметки и URL
+- **WHEN** ответ проходит очистку
+- **THEN** текст ответа сохраняется в одной непустой строке.
+
 ## Связь с реализацией
 
 Источники конкретных ревизий, путей, параметров и внутреннего обмена связаны с требованиями и проверками в таблице.
 
-| Требования | Реализация | Проверки |
-|------------|------------|----------|
-| MODEL-001/002 | [Реестр](../../../sub_translate/translators/registry.py), [жизненный цикл](../../../sub_translate/translators/lifecycle.py) | [Реестр](../../../tests/test_translator_registry.py), [жизненный цикл](../../../tests/test_translator_lifecycle.py) |
-| MODEL-003…005 | [Получение модели](../../../sub_translate/utils/huggingface.py) | [Получение и восстановление](../../../tests/test_model_acquisition.py) |
-| MODEL-006 | [NLLB](../../../sub_translate/translators/local/nllb.py), [TranslateGemma](../../../sub_translate/workers/translategemma_worker.py), [Seed-X](../../../sub_translate/workers/seedx_worker.py) | [Переводчики](../../../tests/test_translators.py), [TranslateGemma](../../../tests/test_translategemma.py), [Seed-X](../../../tests/test_seedx_profile.py) |
-| MODEL-007/009 | [TranslateGemma](../../../sub_translate/workers/translategemma_worker.py), [Seed-X](../../../sub_translate/workers/seedx_worker.py) | [TranslateGemma](../../../tests/test_translategemma.py), [Seed-X](../../../tests/test_seedx_profile.py) |
-| MODEL-008 | [Формат обмена](../../../sub_translate/workers/protocol.py), [команды](../../../sub_translate/workers/common.py), [владение процессом](../../../sub_translate/workers/external_worker.py) | [Изолированный процесс](../../../tests/test_external_worker.py) |
+Ограничение числа строк проверяется также для ответов без удаляемых тегов или URL; регрессии сохраняют исходную
+разметку, ссылки, Unicode и допустимое форматирование. Сценарии и ожидаемое поведение описаны в
+[примерах WEB-001 и MODEL-009](../../context/examples/README.md#проверка-web-001-и-model-009).
+
+| Требования    | Реализация                                                                                                                                                                                    | Проверки                                                                                                                                                   |
+|---------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| MODEL-001/002 | [Реестр](../../../sub_translate/translators/registry.py), [жизненный цикл](../../../sub_translate/translators/lifecycle.py)                                                                   | [Реестр](../../../tests/test_translator_registry.py), [жизненный цикл](../../../tests/test_translator_lifecycle.py)                                        |
+| MODEL-003…005 | [Получение модели](../../../sub_translate/utils/huggingface.py)                                                                                                                               | [Получение и восстановление](../../../tests/test_model_acquisition.py)                                                                                     |
+| MODEL-006     | [NLLB](../../../sub_translate/translators/local/nllb.py), [TranslateGemma](../../../sub_translate/workers/translategemma_worker.py), [Seed-X](../../../sub_translate/workers/seedx_worker.py) | [Переводчики](../../../tests/test_translators.py), [TranslateGemma](../../../tests/test_translategemma.py), [Seed-X](../../../tests/test_seedx_profile.py) |
+| MODEL-007/009 | [TranslateGemma](../../../sub_translate/workers/translategemma_worker.py), [Seed-X](../../../sub_translate/workers/seedx_worker.py)                                                           | [TranslateGemma](../../../tests/test_translategemma.py), [Seed-X](../../../tests/test_seedx_profile.py)                                                    |
+| MODEL-008     | [Формат обмена](../../../sub_translate/workers/protocol.py), [команды](../../../sub_translate/workers/common.py), [владение процессом](../../../sub_translate/workers/external_worker.py)     | [Изолированный процесс](../../../tests/test_external_worker.py)                                                                                            |

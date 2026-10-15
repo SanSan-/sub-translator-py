@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import queue
 import re
 import threading
 from collections.abc import Iterator
+from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -13,9 +17,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from sub_translate import __version__
+from sub_translate import __version__, service
 from sub_translate.enums import FileFormat
 from sub_translate.service import ProcessingResult, ProcessingSettings, ProcessingStatus
+from sub_translate.utils import io_utils
 from sub_translate.web import __main__ as web_main
 from sub_translate.web import app as web_app
 
@@ -92,6 +97,62 @@ def isolated_logger(name: str) -> logging.Logger:
     return logger
 
 
+def assert_anti_framing_headers(response: httpx.Response) -> None:
+    assert response.headers["content-security-policy"] == "frame-ancestors 'none'"
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+@pytest.mark.parametrize("path", ["/", "/static/index.html", "/static/app.js", "/static/styles.css"])
+def test_anti_framing_headers_preserve_static_content(client: TestClient, path: str) -> None:
+    response = client.get(path)
+    filename = "index.html" if path == "/" else path.removeprefix("/static/")
+
+    assert response.status_code == 200
+    assert response.content == (web_app.STATIC_DIR / filename).read_bytes()
+    assert_anti_framing_headers(response)
+
+
+@pytest.mark.parametrize("path", ["/missing", "/static/missing.html"])
+def test_anti_framing_headers_on_missing_routes(client: TestClient, path: str) -> None:
+    response = client.get(path)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+    assert_anti_framing_headers(response)
+
+
+def test_anti_framing_headers_on_unhandled_error(monkeypatch) -> None:
+    monkeypatch.setattr(web_app, "_build_ui_config", Mock(side_effect=RuntimeError("PRIVATE_DETAIL")))
+
+    with TestClient(web_app.app, base_url="http://127.0.0.1", raise_server_exceptions=False) as client:
+        response = client.get("/api/ui-config")
+
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert_anti_framing_headers(response)
+
+
+def test_anti_framing_wrapper_preserves_application_lifespan(monkeypatch) -> None:
+    events = []
+
+    @asynccontextmanager
+    async def lifespan(application):
+        assert application is web_app.fastapi_app
+        events.append("startup")
+        yield
+        events.append("shutdown")
+
+    monkeypatch.setattr(web_app.fastapi_app.router, "lifespan_context", lifespan)
+
+    with TestClient(web_app.app, base_url="http://127.0.0.1") as client:
+        assert events == ["startup"]
+        response = client.get("/api/health")
+        assert response.json() == {"status": "ok", "version": __version__}
+        assert_anti_framing_headers(response)
+
+    assert events == ["startup", "shutdown"]
+
+
 def test_index_health_config_and_openapi(client: TestClient) -> None:
     index_response = client.get("/")
     health_response = client.get("/api/health")
@@ -101,6 +162,7 @@ def test_index_health_config_and_openapi(client: TestClient) -> None:
     assert index_response.status_code == 200
     assert "Sub Translator" in index_response.text
     assert health_response.json() == {"status": "ok", "version": __version__}
+    assert_anti_framing_headers(health_response)
     assert config_response.status_code == 200
     assert config_response.json()["defaults"]["batch_size"] == 21
     assert schema["info"]["version"] == __version__
@@ -138,13 +200,16 @@ def test_ui_config_is_registry_driven_and_contains_no_local_paths() -> None:
     assert seedx["supports_cpu_fallback"] is False
 
 
-def test_translation_settings_normalize_registry_alias_and_optional_paths() -> None:
+@pytest.mark.parametrize("blank", ["", " \t\r\n "])
+def test_translation_settings_normalize_registry_alias_and_optional_paths(blank: str) -> None:
     settings = web_app.TranslationSettings(
         api="translate-gemma-4b",
         tld=" COM ",
-        model_path="  ",
-        model_revision="  ",
-        worker_python_path="  ",
+        model_path=blank,
+        model_revision=blank,
+        worker_python_path=blank,
+        agent_system_prompt_file=blank,
+        agent_prompt_file=blank,
     )
 
     assert settings.api == "translategemma"
@@ -152,6 +217,8 @@ def test_translation_settings_normalize_registry_alias_and_optional_paths() -> N
     assert settings.model_path is None
     assert settings.model_revision is None
     assert settings.worker_python_path is None
+    assert settings.agent_system_prompt_file is None
+    assert settings.agent_prompt_file is None
 
 
 def test_translation_settings_use_profile_timeout_unless_explicit() -> None:
@@ -207,6 +274,7 @@ def test_remote_get_is_rejected_even_with_forwarded_loopback_headers() -> None:
 
     assert response.status_code == 403
     assert response.json() == {"detail": web_app._LOCAL_ACCESS_ERROR}
+    assert_anti_framing_headers(response)
 
 
 def test_testclient_literal_requires_test_transport_marker() -> None:
@@ -223,6 +291,7 @@ def test_dns_rebinding_host_is_rejected(client: TestClient) -> None:
 
     assert response.status_code == 403
     assert response.json() == {"detail": web_app._LOCAL_ACCESS_ERROR}
+    assert_anti_framing_headers(response)
 
 
 def test_remote_post_is_rejected_before_handler(monkeypatch) -> None:
@@ -239,6 +308,7 @@ def test_remote_post_is_rejected_before_handler(monkeypatch) -> None:
 
     assert response.status_code == 403
     unload.assert_not_called()
+    assert_anti_framing_headers(response)
 
 
 def test_cross_origin_post_is_rejected_and_same_origin_is_allowed(
@@ -263,6 +333,8 @@ def test_cross_origin_post_is_rejected_and_same_origin_is_allowed(
     assert rejected.json() == {"detail": web_app._ORIGIN_ACCESS_ERROR}
     assert allowed.status_code == 200
     unload.assert_called_once_with()
+    assert_anti_framing_headers(rejected)
+    assert_anti_framing_headers(allowed)
 
 
 @pytest.mark.parametrize(
@@ -298,6 +370,7 @@ def test_settings_validation_rejects_unregistered_translator(client: TestClient)
     assert response.status_code == 422
     assert response.json() == {"detail": web_app._REQUEST_VALIDATION_ERROR}
     assert unknown_id not in response.text
+    assert_anti_framing_headers(response)
     assert all(key not in response.text for key in ('"input"', '"ctx"', '"msg"', '"url"'))
 
 
@@ -695,9 +768,31 @@ def test_apply_agent_prompts_uses_inline_values(monkeypatch) -> None:
     user.assert_called_once_with("user", variant="ui")
 
 
-def test_apply_agent_prompts_reads_files_and_rejects_missing(monkeypatch, tmp_path: Path) -> None:
-    system_path = tmp_path / "system.txt"
-    user_path = tmp_path / "user.txt"
+@pytest.mark.parametrize("field", ["agent_system_prompt_file", "agent_prompt_file"])
+@pytest.mark.parametrize("blank", ["", " \t\r\n "])
+def test_resolve_agent_prompts_ignores_blank_paths(monkeypatch, field: str, blank: str) -> None:
+    settings = web_app.TranslationSettings(api="agent", **{field: blank})
+    path_factory = Mock(side_effect=AssertionError("Пустой путь не должен обращаться к файловой системе."))
+    read_prompt_file = Mock(side_effect=AssertionError("Пустой путь не должен читать файл подсказки."))
+    monkeypatch.setattr(web_app, "Path", path_factory)
+    monkeypatch.setattr(web_app, "read_text", read_prompt_file)
+
+    result = web_app._resolve_agent_prompts(settings)
+
+    assert result == (
+        web_app.SYSTEM_PROMPT,
+        web_app.get_prompt_template(web_app.DEFAULT_PROMPT_VARIANT),
+        web_app.DEFAULT_PROMPT_VARIANT,
+    )
+    assert getattr(settings, field) is None
+    path_factory.assert_not_called()
+    read_prompt_file.assert_not_called()
+
+
+@pytest.mark.parametrize("padding", ["", "  "])
+def test_apply_agent_prompts_reads_files_and_rejects_missing(monkeypatch, tmp_path: Path, padding: str) -> None:
+    system_path = tmp_path / "system prompt.txt"
+    user_path = tmp_path / "user prompt.txt"
     system_path.write_text("система", encoding="utf-8")
     user_path.write_text("пользователь", encoding="utf-8")
     system = Mock()
@@ -705,14 +800,16 @@ def test_apply_agent_prompts_reads_files_and_rejects_missing(monkeypatch, tmp_pa
     monkeypatch.setattr(web_app, "set_system_prompt", system)
     monkeypatch.setattr(web_app, "set_user_prompt_template", user)
 
-    web_app._apply_agent_prompts(
-        web_app.TranslationSettings(
-            api="agent",
-            agent_system_prompt_file=str(system_path),
-            agent_prompt_file=str(user_path),
-        )
+    settings = web_app.TranslationSettings(
+        api="agent",
+        agent_system_prompt_file=f"{padding}{system_path}{padding}",
+        agent_prompt_file=f"{padding}{user_path}{padding}",
     )
 
+    web_app._apply_agent_prompts(settings)
+
+    assert settings.agent_system_prompt_file == str(system_path)
+    assert settings.agent_prompt_file == str(user_path)
     system.assert_called_once_with("система")
     user.assert_called_once_with("пользователь", variant="file")
     missing_settings = web_app.TranslationSettings(
@@ -815,6 +912,60 @@ def test_run_job_reports_partial_result_and_cleans_handlers(monkeypatch, tmp_pat
     assert logger.handlers == []
     assert web_app._active_job_id is None
     apply_agent_prompts.assert_not_called()
+
+
+@pytest.mark.parametrize("target_name", ["source", "other"])
+def test_run_job_rejects_output_symlink_and_translates_neighbor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target_name: str,
+) -> None:
+    source = tmp_path / "source.en.srt"
+    other = tmp_path / "other.srt"
+    valid = tmp_path / "valid.en.srt"
+    output = tmp_path / "source.google.ru.srt"
+    cache_path = tmp_path / "cache.json"
+    for path, text in ((source, "Unsafe source"), (other, "Сторонний файл"), (valid, "Valid neighbor")):
+        path.write_text(VALID_SRT.replace("Текст", text), encoding="utf-8", newline="")
+    original = {path: path.read_bytes() for path in (source, other, valid)}
+    try:
+        output.symlink_to(source if target_name == "source" else other)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Символические ссылки недоступны: {exc}")
+    translator = Mock()
+    translator.translate_batch.side_effect = lambda texts, _options: ["Перевод" for _text in texts]
+    logger = isolated_logger(f"test_run_job_output_symlink_{target_name}")
+    monkeypatch.setattr(service, "get_translator", lambda *_args: translator)
+    monkeypatch.setattr(io_utils, "CACHE_DIR", tmp_path / "locks")
+    monkeypatch.setattr(web_app, "_get_logger", lambda *_args, **_kwargs: logger)
+    monkeypatch.setattr(
+        web_app, "process_subtitle_batch", partial(service.process_subtitle_batch, cache_path=cache_path)
+    )
+    job = make_job(paths=[source, valid], settings=web_app.TranslationSettings(api="google", force=True))
+    with web_app._active_job_lock:
+        web_app._active_job_id = job.job_id
+
+    web_app._run_job(job)
+
+    assert job.completed is True
+    assert job.status == "partial"
+    assert job.file_states[str(source)] == {
+        "state": "error",
+        "progress": 100,
+        "error": "Не удалось перевести файл.",
+    }
+    assert job.file_states[str(valid)]["state"] == "done"
+    assert {path: path.read_bytes() for path in original} == original
+    assert output.is_symlink()
+    assert "Перевод" in (tmp_path / "valid.google.ru.srt").read_text(encoding="utf-8")
+    assert translator.translate_batch.call_count == 1
+    assert translator.translate_batch.call_args.args[0] == ["Valid neighbor"]
+    entries = json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+    assert len(entries) == 1
+    assert next(iter(entries.values()))["signature"]["source_sha256"] == hashlib.sha256(original[valid]).hexdigest()
+    assert drain_events(job)[-1] == {"type": "done", "status": "partial"}
+    assert logger.handlers == []
+    assert web_app._active_job_id is None
 
 
 def test_finish_job_downgrades_ok_when_some_files_are_unresolved() -> None:
@@ -1098,6 +1249,7 @@ def test_translate_thread_start_failure_rolls_back_registry(
     )
 
     assert response.status_code == 503
+    assert_anti_framing_headers(response)
     assert response.json() == {"detail": "Не удалось запустить задачу перевода."}
     assert "RAW_THREAD_START_PRIVATE_DETAIL" not in response.text
     assert "Traceback" not in response.text
@@ -1409,6 +1561,7 @@ def test_unload_endpoint_uses_shared_local_lifecycle(client: TestClient, monkeyp
 
     assert response.json() == {"status": "ok", "message": "Модели выгружены."}
     unload.assert_called_once_with()
+    assert_anti_framing_headers(response)
 
 
 def test_unload_endpoint_rejects_active_job(client: TestClient, monkeypatch) -> None:
@@ -1435,6 +1588,7 @@ def test_unload_endpoint_returns_safe_error(client: TestClient, monkeypatch) -> 
     response = client.post("/api/unload", json={})
 
     assert response.status_code == 500
+    assert_anti_framing_headers(response)
     assert response.json() == {"detail": "Не удалось выгрузить локальную модель."}
     assert "внутренняя диагностика" not in response.text
 
@@ -1463,6 +1617,7 @@ def test_stream_returns_keepalive_and_done_event(client: TestClient) -> None:
     response = client.get(f"/api/stream/{job.job_id}")
 
     assert response.status_code == 200
+    assert_anti_framing_headers(response)
     assert response.headers["content-type"].startswith("text/event-stream")
     assert ": keep-alive" in response.text
     assert 'data: {"type": "done", "status": "ok"}' in response.text

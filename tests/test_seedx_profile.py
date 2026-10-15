@@ -800,6 +800,49 @@ def test_seedx_generated_markup_does_not_add_subtitle_lines(
 @pytest.mark.parametrize(
     ("source_text", "result", "expected"),
     [
+        ("One source line.", "Первая строка.\nВторая строка.", "Первая строка. Вторая строка."),
+        ("First line.\nSecond line.", "Один.\nДва.\nТри.", "Один.\nДва. Три."),
+        ("One source line.", "名 Иванов\r\n\r\nNo, no, no!", "名 Иванов No, no, no!"),
+        (
+            "Read <b>Hello</b> at https://example.org/docs.",
+            "Прочтите <b>Привет</b>\nна https://example.org/docs.",
+            "Прочтите <b>Привет</b> на https://example.org/docs.",
+        ),
+    ],
+)
+def test_seedx_limits_plain_output_lines_to_source(
+    source_text: str,
+    result: str,
+    expected: str,
+) -> None:
+    assert _sanitize_translation_result(result, "Translate prompt", "ru", source_text) == expected
+
+
+@pytest.mark.parametrize(
+    ("source_text", "result"),
+    [
+        ("One source line.", "Нет,  нет, нет!"),
+        ("First line.\nSecond line.", "Первая  строка.\r\n\tВторая строка."),
+        ("First line.\nSecond line.", "Первая строка.\n\n Вторая строка."),
+        (
+            "Read <b>Hello</b>.\nOpen https://example.org/docs.",
+            "Прочтите <b>Привет</b>.\nОткройте  https://example.org/docs.",
+        ),
+    ],
+)
+def test_seedx_preserves_formatting_within_source_line_limit(source_text: str, result: str) -> None:
+    assert _sanitize_translation_result(result, "Translate prompt", "ru", source_text) == result
+
+
+@pytest.mark.parametrize("result", ["", " \n\t", "\n <ru> \t\n"])
+def test_seedx_rejects_empty_plain_output(result: str) -> None:
+    with pytest.raises(SeedXRuntimeError, match="пустой"):
+        _sanitize_translation_result(result, "Translate prompt", "ru", "Original text")
+
+
+@pytest.mark.parametrize(
+    ("source_text", "result", "expected"),
+    [
         ("<p>source</p>", '<p onclick="evil()">translation</p>', "translation"),
         ("<p>source</p>", "<p>generated</p><p>translation</p>", "<p>generated translation</p>"),
         (

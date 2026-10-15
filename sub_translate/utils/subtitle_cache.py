@@ -18,7 +18,13 @@ from filelock import FileLock
 from sub_translate.constants import SUBTITLE_CACHE_FILE
 from sub_translate.dictionaries.languages import get_code
 from sub_translate.enums import FileFormat
-from sub_translate.utils.io_utils import atomic_write_json, atomic_write_text
+from sub_translate.utils.io_utils import (
+    atomic_write_json,
+    publish_subtitle_text,
+    resolve_output_path,
+    validate_distinct_files,
+    validate_subtitle_output,
+)
 from sub_translate.utils.validation_utils import (
     ass_validator,
     srt_start_validator,
@@ -626,12 +632,11 @@ def restore_output_cache(
     policy: CachePolicy = DEFAULT_CACHE_POLICY,
 ) -> CacheRestoreStatus:
     """Восстанавливает проверенный результат, не заменяя пользовательский файл без ``force``."""
-    resolved_output = output_path.expanduser().resolve()
+    resolved_output = resolve_output_path(output_path)
     resolved_cache = Path(cache_path).expanduser().resolve()
-    if resolved_output == identity.source_path:
-        raise ValueError("Исходный и выходной пути не должны совпадать.")
-    if resolved_output == resolved_cache:
-        raise ValueError("Выходной файл и файл кеша не должны совпадать.")
+    protected_paths = (identity.source_path, resolved_cache)
+    validate_subtitle_output(resolved_output, protected_paths=protected_paths)
+    validate_distinct_files(resolved_cache, protected_paths=(identity.source_path,))
     if resolved_output.exists() and not force:
         return CacheRestoreStatus.OUTPUT_EXISTS
     status, cached_output = _lookup_lines(identity, logger, resolved_cache, policy)
@@ -639,7 +644,12 @@ def restore_output_cache(
         return status
     lines, line_separator = cached_output
     try:
-        atomic_write_text(resolved_output, line_separator.join(lines), overwrite=force)
+        publish_subtitle_text(
+            resolved_output,
+            line_separator.join(lines),
+            overwrite=force,
+            protected_paths=protected_paths,
+        )
     except FileExistsError:
         return CacheRestoreStatus.OUTPUT_EXISTS
     except OSError as exc:
@@ -660,12 +670,10 @@ def store_output_cache(
     if identity.local_model_unavailable:
         logger.warning("Результат не добавлен в кеш: локальная модель недоступна для построения полной подписи.")
         return False
-    resolved_output = output_path.expanduser().resolve()
+    resolved_output = resolve_output_path(output_path)
     resolved_cache = Path(cache_path).expanduser().resolve()
-    if resolved_output == identity.source_path:
-        raise ValueError("Исходный и выходной пути не должны совпадать.")
-    if resolved_output == resolved_cache or identity.source_path == resolved_cache:
-        raise ValueError("Пользовательский файл и файл кеша не должны совпадать.")
+    validate_subtitle_output(resolved_output, protected_paths=(identity.source_path, resolved_cache))
+    validate_distinct_files(resolved_cache, protected_paths=(identity.source_path,))
     try:
         lines, line_separator = _read_utf8_lines(resolved_output)
     except (OSError, ValueError) as exc:

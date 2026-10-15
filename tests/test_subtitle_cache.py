@@ -321,6 +321,93 @@ def test_cache_path_cannot_replace_source_or_output(tmp_path: Path) -> None:
         restore_output_cache(identity, output, LOGGER, force=True, cache_path=output)
 
 
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize(
+    "alias", ["source_symlink", "other_symlink", "missing_symlink", "source_hardlink", "cache_hardlink"]
+)
+def test_restore_rejects_output_alias_without_changing_files(
+    tmp_path: Path,
+    force: bool,
+    alias: str,
+) -> None:
+    source = tmp_path / "source.srt"
+    other = tmp_path / "other.srt"
+    missing = tmp_path / "missing.srt"
+    destination = tmp_path / "destination.srt"
+    cache_path = tmp_path / "cache.json"
+    _write_utf8(source, VALID_SRT)
+    _write_utf8(other, [*VALID_SRT[:2], "Другой текст", ""])
+    identity = _identity(source)
+    assert store_output_cache(identity, other, LOGGER, cache_path=cache_path)
+    original = {path: path.read_bytes() for path in (source, other, cache_path)}
+    targets = {"source": source, "other": other, "missing": missing, "cache": cache_path}
+    target_name, link_type = alias.split("_")
+    try:
+        if link_type == "hardlink":
+            destination.hardlink_to(targets[target_name])
+        else:
+            destination.symlink_to(targets[target_name])
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Ссылки недоступны: {exc}")
+
+    with pytest.raises(ValueError):
+        restore_output_cache(identity, destination, LOGGER, force=force, cache_path=cache_path)
+
+    assert {path: path.read_bytes() for path in original} == original
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("operation", [restore_output_cache, store_output_cache])
+def test_cache_hardlink_to_source_is_rejected(tmp_path: Path, operation) -> None:
+    source = tmp_path / "source.srt"
+    output = tmp_path / "output.srt"
+    cache_path = tmp_path / "cache.json"
+    _write_utf8(source, VALID_SRT)
+    _write_utf8(output, VALID_SRT)
+    original = source.read_bytes()
+    try:
+        cache_path.hardlink_to(source)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Жёсткие ссылки недоступны: {exc}")
+
+    identity = _identity(source)
+    with pytest.raises(ValueError, match="не должны совпадать"):
+        operation(identity, output, LOGGER, cache_path=cache_path)
+
+    assert source.read_bytes() == cache_path.read_bytes() == original
+
+
+def test_restore_rejects_unreadable_cache_directory_without_output(tmp_path: Path) -> None:
+    source = tmp_path / "source.srt"
+    output = tmp_path / "output.srt"
+    cache_path = tmp_path / "cache.json"
+    _write_utf8(source, VALID_SRT)
+    cache_path.mkdir()
+
+    status = restore_output_cache(_identity(source), output, LOGGER, cache_path=cache_path)
+
+    assert status is CacheRestoreStatus.CACHE_REJECTED
+    assert not output.exists()
+    assert cache_path.is_dir()
+    assert list(cache_path.iterdir()) == []
+
+
+def test_store_rejects_unreadable_cache_directory_without_changing_output(tmp_path: Path) -> None:
+    source = tmp_path / "source.srt"
+    output = tmp_path / "output.srt"
+    cache_path = tmp_path / "cache.json"
+    _write_utf8(source, VALID_SRT)
+    _write_utf8(output, VALID_SRT)
+    cache_path.mkdir()
+    original = output.read_bytes()
+
+    assert not store_output_cache(_identity(source), output, LOGGER, cache_path=cache_path)
+
+    assert output.read_bytes() == original
+    assert cache_path.is_dir()
+    assert list(cache_path.iterdir()) == []
+
+
 def test_output_with_bom_is_not_cached(tmp_path: Path) -> None:
     source = tmp_path / "source.srt"
     output = tmp_path / "output.srt"

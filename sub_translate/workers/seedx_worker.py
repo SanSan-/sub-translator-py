@@ -528,7 +528,8 @@ def _sanitize_translation_result(
         raise SeedXRuntimeError("Seed-X вернула часть исходного запроса вместо перевода.")
     cleaned, html_changed = _strip_generated_html(cleaned, source_text)
     cleaned, url_changed = _strip_foreign_urls(cleaned, source_text)
-    if html_changed or url_changed:
+    line_count = sum(bool(line.strip()) for line in cleaned.splitlines())
+    if html_changed or url_changed or line_count > max(1, len(source_text.splitlines())):
         cleaned = _normalize_cleaned_lines(cleaned, source_text)
     if not cleaned:
         raise SeedXRuntimeError("Seed-X вернула пустой перевод.")

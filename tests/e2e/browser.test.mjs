@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createServer } from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -112,6 +113,93 @@ after(async () => {
     serverProcess.kill();
   }
 });
+
+async function createFrameParent(targetUrl) {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><html><body>
+      <iframe id="target" src="${targetUrl}" width="1200" height="900"></iframe>
+    </body></html>`);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return { server, url: `http://127.0.0.1:${server.address().port}` };
+}
+
+async function stubUnload(page) {
+  const requests = [];
+  await page.route("**/api/unload", async (route) => {
+    requests.push(route.request());
+    await route.fulfill({ json: { status: "ok", message: "Модели выгружены." } });
+  });
+  return requests;
+}
+
+async function clickUnload(page, button) {
+  const [response] = await Promise.all([
+    page.waitForResponse(`${baseUrl}/api/unload`),
+    button.click(),
+  ]);
+  assert.equal(response.status(), 200);
+}
+
+for (const uiPath of ["/", "/static/index.html"]) {
+  test(`запрет встраивания ${uiPath}: контроль, iframe и отдельная вкладка`, { timeout: 30000 }, async () => {
+    const targetUrl = `${baseUrl}${uiPath}`;
+    const parent = await createFrameParent(targetUrl);
+    const control = await browser.newPage();
+    const blocked = await browser.newPage();
+    const standalone = await browser.newPage();
+    try {
+      assert.notEqual(new URL(parent.url).origin, new URL(targetUrl).origin);
+      const controlRequests = await stubUnload(control);
+      await control.route(targetUrl, async (route) => {
+        const response = await route.fetch();
+        const headers = response.headers();
+        assert.equal(response.status(), 200);
+        assert.equal(headers["content-security-policy"], "frame-ancestors 'none'");
+        assert.equal(headers["x-frame-options"], "DENY");
+        delete headers["content-security-policy"];
+        delete headers["x-frame-options"];
+        await route.fulfill({ response, headers });
+      });
+      await control.goto(parent.url);
+      const controlButton = control.frameLocator("#target").locator("#unloadBtn");
+      await controlButton.waitFor({ state: "visible" });
+      const buttonBounds = await controlButton.boundingBox();
+      assert.ok(buttonBounds);
+      await clickUnload(control, controlButton);
+      assert.equal(controlRequests.length, 1);
+      assert.equal(controlRequests[0].headers().origin, baseUrl);
+
+      const blockedRequests = await stubUnload(blocked);
+      const policyViolation = blocked.waitForEvent("console", {
+        predicate: (message) => message.type() === "error" && message.text().includes("frame-ancestors"),
+      });
+      const documentResponse = blocked.waitForResponse(targetUrl);
+      await blocked.goto(parent.url);
+      const response = await documentResponse;
+      assert.equal(response.status(), 200);
+      assert.equal(response.headers()["content-security-policy"], "frame-ancestors 'none'");
+      assert.equal(response.headers()["x-frame-options"], "DENY");
+      await policyViolation;
+      assert.equal(await blocked.frameLocator("#target").locator("#unloadBtn").count(), 0);
+      await blocked.mouse.click(buttonBounds.x + buttonBounds.width / 2, buttonBounds.y + buttonBounds.height / 2);
+      assert.equal(blockedRequests.length, 0);
+
+      const standaloneRequests = await stubUnload(standalone);
+      await standalone.goto(targetUrl);
+      await clickUnload(standalone, standalone.locator("#unloadBtn"));
+      assert.equal(standaloneRequests.length, 1);
+    } finally {
+      await Promise.all([control.close(), blocked.close(), standalone.close()]);
+      parent.server.closeAllConnections();
+      await new Promise((resolve, reject) => parent.server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+}
 
 for (const scenario of [
   { name: "ошибка ui-config не мешает восстановить активную задачу", configError: true, activeFailures: 0, jobChar: "3" },

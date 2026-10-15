@@ -31,7 +31,7 @@ from sub_translate.translators.registry import (
     resolve_translator_id,
 )
 from sub_translate.utils.env_utils import load_env
-from sub_translate.utils.io_utils import configure_utf8_stdio, read_text
+from sub_translate.utils.io_utils import configure_utf8_stdio, read_text, validate_subtitle_output
 from sub_translate.utils.logging_utils import configure_rotating_logger
 from sub_translate.utils.subtitle_cache import prompt_signature
 
@@ -221,8 +221,7 @@ def _prepare_request(
         settings.api,
         file_format,
     )
-    if output_path == input_path:
-        raise ValueError("Исходный и выходной пути не должны совпадать.")
+    validate_subtitle_output(output_path, protected_paths=(input_path,))
     return input_path, settings, file_format, source_lang, output_path
 
 
